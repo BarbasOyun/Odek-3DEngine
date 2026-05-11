@@ -1,6 +1,8 @@
-# 3D Engine
+# Odek - 3D Engine
 
--Using Rust + egui<br>
+-Odek is a 3D Engine written in Rust and using egui for rendering<br>
+-It as both a desktop and web version<br>
+-WIP<br>
 -Using [This Tsoding video](https://www.youtube.com/watch?v=qjWkNZ0SXfo&list=WL&index=9&t=17s) as reference<br>
 
 ## Controls

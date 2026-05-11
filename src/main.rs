@@ -142,20 +142,22 @@ impl ThreeDEngine {
         let (tx, rx) = channel::<Vec<u8>>();
 
         Self {
-            // RENDERING
+            // CAMERA
             smoothed_fps: 60.0,
             camera_position: Vec3::new(0.0, 0.0, 0.0),
             camera_rotation: Vec3::new(0.0, 180.0, 0.0),
-            camera_speed: 0.05,
-            sensitivity: 0.1,
+            camera_speed: 2.0,
+            sensitivity: 5.0,
             camera_forward: Vec3::new(0.0, 0.0, 1.0),
             fov: 90.0,
+            // RENDERING
             stroke: egui::Stroke::new(2.0, egui::Color32::from_rgb(190, 110, 40)),
             perspective: true,
             display_vertices: true,
-            // LOGIC : Transformations
+            // LOGIC : Inputs
             bindings: Bindings::qwerty(),
             azerty: false,
+            // LOGIC : Transformations
             model_position: glam::Vec3::new(0.0, 0.0, 1.0),
             model_rotation: Vec3::new(0.0, 0.0, 0.0),
             model_scale: Vec3::new(1.0, 1.0, 1.0),
@@ -198,29 +200,26 @@ impl ThreeDEngine {
     }
 
     fn calc_camera_forward(&mut self) {
+        // Calculate camera's forward vector based on its yaw and pitch (rotation)
+        // YAW
         let yaw_rad = self.camera_rotation.y.to_radians();
-        let pitch_rad = self.camera_rotation.x.to_radians();
+        let cos_yaw = yaw_rad.cos();
+        let sin_yaw = yaw_rad.sin();
 
+        // PITCH
+        let pitch_rad = self.camera_rotation.x.to_radians();
         let cos_pitch = pitch_rad.cos();
         let sin_pitch = pitch_rad.sin();
 
-        let cos_yaw = yaw_rad.cos();
-        let sin_yaw = yaw_rad.sin();
         self.camera_forward =
             Vec3::new(cos_pitch * sin_yaw, sin_pitch, -cos_pitch * cos_yaw).normalize();
     }
 
     // RENDERING
 
-    // Wireframe Rendering -> New Engine : Frame Image
+    // Wireframe Rendering -> New Engine : Generate Frame Image
     fn render_frame(&self, rect: &egui::Rect, painter: &egui::Painter) {
-        let projection_function = if self.perspective {
-            Self::perspective_project
-        } else {
-            Self::orthographic_project
-        };
-
-        let screen_points: Vec<Option<egui::Vec2>> = self.frame_image(&rect, &projection_function);
+        let screen_points: Vec<Option<egui::Vec2>> = self.frame_image(&rect);
 
         // Render Vertices
         if self.display_vertices {
@@ -242,54 +241,62 @@ impl ThreeDEngine {
         }
     }
 
-    // Base Model -> Model Matrix (Model + Transformations) + View + Projection -> 2D Frustum (Projection) -> Screen Space
+    // Base Model -> Model Matrix (Model & Transformations) + View/Camera + Projection -> 2D Frustum (Projection) -> Screen Space
     fn frame_image(
         &self,
         rect: &egui::Rect,
-        projection_function: &dyn Fn(&Self, &Vec3) -> Vec2,
     ) -> Vec<Option<egui::Vec2>> {
+        // 1) Model Matrix = Model + Transformations
+        let model = glam::Mat4::from_scale_rotation_translation(
+            self.model_scale,
+            glam::Quat::from_euler(
+                glam::EulerRot::YXZ,
+                self.model_rotation.y.to_radians(),
+                self.model_rotation.x.to_radians(),
+                self.model_rotation.z.to_radians(),
+            ),
+            self.model_position,
+        );
+
+        // 2) Camera / View Matrix
+        let view = glam::Mat4::look_at_rh(
+            self.camera_position,
+            self.camera_position + self.camera_forward,
+            Vec3::Y,
+        ); // Vec3::Y = (0, 1, 0)
+
+        // 3) Projection Matrix
+        let projection = glam::Mat4::perspective_rh(
+            self.fov.to_radians(),
+            1.0,
+            0.1,    // Near clip
+            1000.0, // Far clip
+        );
+
+        // 4) Apply Matrices : Model -> View -> Projection
+        let mvp: glam::Mat4 = projection * view * model;
+
         return self
             .vertices
             .iter()
             .map(|v| {
-                // 1) Model Matrix = Model + Transformations
-                let model = glam::Mat4::from_scale_rotation_translation(
-                    self.model_scale,
-                    glam::Quat::from_euler(
-                        glam::EulerRot::YXZ,
-                        self.model_rotation.y.to_radians(),
-                        self.model_rotation.x.to_radians(),
-                        self.model_rotation.z.to_radians(),
-                    ),
-                    self.model_position,
-                );
-
-                // 2) Camera / View Matrix
-                let view = glam::Mat4::look_at_rh(
-                    self.camera_position,
-                    self.camera_position + self.camera_forward,
-                    Vec3::Y,
-                ); // Vec3::Y = (0, 1, 0)
-
-                // 3) Projection Matrix
-                let projection = glam::Mat4::perspective_rh(
-                    self.fov.to_radians(),
-                    1.0,
-                    0.1,    // Near clip
-                    1000.0, // Far clip
-                );
-
-                // 4) Apply Matrices : Model -> View -> Projection
-                let mvp: glam::Mat4 = projection * view * model;
-                let world_v: Vec3 = mvp.project_point3(*v);
+                let world_v: Vec3 = mvp.project_point3(*v); // World Vertex
 
                 // 5) Projection
                 let is_in_fov =
                     world_v.x.abs() <= 1.0 && world_v.y.abs() <= 1.0 && world_v.z.abs() <= 1.0;
 
+                let fulcrum_point: Vec2;
+
+                if self.perspective {
+                    fulcrum_point = self.perspective_project(&world_v);
+                } else {
+                    fulcrum_point = self.orthographic_project(&world_v);
+                }
+
                 return (is_in_fov).then(|| {
                     Self::proj_to_screen(
-                        &projection_function(&self, &world_v),
+                        &fulcrum_point,
                         rect.width(),
                         rect.height(),
                     )
@@ -375,6 +382,7 @@ impl ThreeDEngine {
     }
 
     fn hud(&mut self, rect: &egui::Rect, painter: &egui::Painter, fps: f32) {
+        // Displayed on top of the 3D View
         // FPS Display
         let alpha = 0.05;
         self.smoothed_fps = (self.smoothed_fps * (1.0 - alpha)) + (fps * alpha);
@@ -467,7 +475,7 @@ impl ThreeDEngine {
 
     // OLD ENGINE
 
-    // synchronous Load OBJ File
+    // Old Load OBJ File : synchronous
     // use rfd::{FileDialog, FileHandle};
     // use std::path::PathBuf;
 
@@ -672,9 +680,9 @@ impl eframe::App for ThreeDEngine {
                 self.load_obj_bytes(bytes);
             }
 
-            // INTERFACE
+            // USER INTERFACE
 
-            // Settings : Import OBJ, Reset, Perspective, Render Vertices, Bindings
+            // Settings : Import OBJ, Reset Scene, Perspective, Render Vertices, Bindings
             ui.horizontal(|ui| {
                 // Import OBJ
                 if ui.button("Import OBJ").clicked() {
@@ -687,13 +695,13 @@ impl eframe::App for ThreeDEngine {
                     self.pick_obj_async();
                 }
 
-                // Reset
-                if ui.button("Reset").clicked() {
+                // Reset Scene
+                if ui.button("Reset Scene").clicked() {
                     *self = Self::new();
                     self.cube();
                 }
 
-                // Rendering
+                // Rendering Settings
                 ui.checkbox(&mut self.perspective, "Perspective");
                 ui.add(
                     egui::DragValue::new(&mut self.fov)
@@ -796,31 +804,33 @@ impl eframe::App for ThreeDEngine {
 
             // Camera Controls
             self.calc_camera_forward();
-            ui.input(|i| {
+            ui.input(|input| {
                 // Camera Position
-                if i.key_down(self.bindings.forward) {
-                    self.camera_position += self.camera_forward * self.camera_speed; // Forward
-                } else if i.key_down(self.bindings.backward) {
-                    self.camera_position -= self.camera_forward * self.camera_speed; // Backward
+                if input.key_down(self.bindings.forward) {
+                    self.camera_position += self.camera_forward * self.camera_speed * dt; // Forward
+                } else if input.key_down(self.bindings.backward) {
+                    self.camera_position -= self.camera_forward * self.camera_speed * dt; // Backward
                 }
 
-                if i.key_down(self.bindings.left) {
-                    self.camera_position -= self.camera_forward.cross(Vec3::Y) * self.camera_speed; // Left
-                } else if i.key_down(self.bindings.right) {
-                    self.camera_position += self.camera_forward.cross(Vec3::Y) * self.camera_speed; // Right
+                if input.key_down(self.bindings.left) {
+                    self.camera_position -=
+                        self.camera_forward.cross(Vec3::Y) * self.camera_speed * dt; // Left
+                } else if input.key_down(self.bindings.right) {
+                    self.camera_position +=
+                        self.camera_forward.cross(Vec3::Y) * self.camera_speed * dt; // Right
                 }
 
                 // Camera Angle
-                if i.pointer.secondary_down() {
-                    let delta = i.pointer.delta();
-                    self.camera_rotation.y += delta.x * self.sensitivity; // Yaw / Horizontal
-                    self.camera_rotation.x -= delta.y * self.sensitivity; // Pitch / Vertical
+                if input.pointer.secondary_down() {
+                    let mouse_delta = input.pointer.delta();
+                    self.camera_rotation.y += mouse_delta.x * self.sensitivity * dt; // Yaw / Horizontal
+                    self.camera_rotation.x -= mouse_delta.y * self.sensitivity * dt; // Pitch / Vertical
                 }
             });
 
             self.automatic_transform(dt);
 
-            // 3D RENDERING
+            // 3D RENDERING VIEW
 
             // Draw Area
             let (response, painter) =
