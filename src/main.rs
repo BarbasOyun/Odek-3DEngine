@@ -1,13 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
+// mod old_engine;
+
 use std::vec;
 
 use eframe::egui::*;
-use glam::Vec3; // egui doesn't have Vec3
+use glam::Vec3;
 
 // Import File
-use rfd::{AsyncFileDialog, FileHandle};
+use rfd::{AsyncFileDialog};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use tobj::LoadOptions;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
@@ -144,7 +145,7 @@ impl ThreeDEngine {
         Self {
             // CAMERA
             smoothed_fps: 60.0,
-            camera_position: Vec3::new(0.0, 0.0, 0.0),
+            camera_position: Vec3::new(0.0, 0.0, -1.0),
             camera_rotation: Vec3::new(0.0, 180.0, 0.0),
             camera_speed: 2.0,
             sensitivity: 5.0,
@@ -158,7 +159,7 @@ impl ThreeDEngine {
             bindings: Bindings::qwerty(),
             azerty: false,
             // LOGIC : Transformations
-            model_position: glam::Vec3::new(0.0, 0.0, 1.0),
+            model_position: glam::Vec3::new(0.0, 0.0, 0.0),
             model_rotation: Vec3::new(0.0, 0.0, 0.0),
             model_scale: Vec3::new(1.0, 1.0, 1.0),
             translate: false,
@@ -472,199 +473,6 @@ impl ThreeDEngine {
         self.vertices = vertices;
         self.faces = faces;
     }
-
-    // OLD ENGINE
-
-    // Old Load OBJ File : synchronous
-    // use rfd::{FileDialog, FileHandle};
-    // use std::path::PathBuf;
-
-    // fn pick_obj_file() -> Option<PathBuf> {
-    //     let file = FileDialog::new()
-    //         .add_filter("Object Files", &["obj"]) // Filter for .obj files
-    //         .set_directory("/") // Starting directory
-    //         .pick_file();
-
-    //     return file;
-    // }
-
-    fn load_obj_custom(&mut self, path: &str) {
-        // Load the file
-        let (models, _) = tobj::load_obj(
-            path,
-            &LoadOptions {
-                triangulate: true, // Converts quads to triangles automatically
-                single_index: true,
-                ..Default::default()
-            },
-        )
-        .expect("Failed to load OBJ file");
-
-        let mesh = &models[0].mesh;
-        self.load_mesh(mesh);
-    }
-
-    // Engine 1
-    fn old_frame_image(
-        &self,
-        rect: &egui::Rect,
-        projection_function: &dyn Fn(&Self, &Vec3) -> Vec2,
-    ) -> Vec<Option<egui::Vec2>> {
-        let rotation_matrix_x = glam::Mat3::from_rotation_x(self.model_rotation.x.to_radians());
-        let rotation_matrix_y = glam::Mat3::from_rotation_y(self.model_rotation.y.to_radians());
-        let rotation_matrix_z = glam::Mat3::from_rotation_z(self.model_rotation.z.to_radians());
-        let scale_matrix = glam::Mat3::from_diagonal(self.model_scale);
-
-        return self
-            .vertices
-            .iter()
-            .map(|v| {
-                // 1] Model + Transformations -> World Space
-                let mut world_v =
-                    scale_matrix * rotation_matrix_z * rotation_matrix_y * rotation_matrix_x * *v;
-                world_v += self.model_position;
-
-                // 2] World Space -> View Space (Camera)
-                // View Position
-                world_v = self.relative_vertex(&world_v);
-
-                // View Rotation = Camera Rotation inverse
-                let cam_quat = glam::Quat::from_euler(
-                    glam::EulerRot::YXZ,
-                    self.camera_rotation.y.to_radians(),
-                    self.camera_rotation.x.to_radians(),
-                    self.camera_rotation.z.to_radians(),
-                );
-
-                let view_quat = cam_quat.inverse();
-                let view_matrix = glam::Mat3::from_quat(view_quat);
-
-                world_v = view_matrix * world_v;
-
-                // 3] Projection
-                return (world_v.z - self.camera_position.z > 0.1).then(|| {
-                    Self::proj_to_screen(
-                        &projection_function(&self, &world_v),
-                        rect.width(),
-                        rect.height(),
-                    )
-                });
-            })
-            .collect();
-    }
-
-    fn relative_vertex(&self, vertex: &Vec3) -> Vec3 {
-        return Vec3::new(
-            vertex.x - self.camera_position.x,
-            vertex.y - self.camera_position.y,
-            vertex.z - self.camera_position.z,
-        );
-    }
-
-    fn calc_fov(&self) -> f32 {
-        let fov_rad = self.fov.to_radians();
-        return 1.0 / (fov_rad * 0.5).tan();
-    }
-
-    fn old_perspective_project(&self, vertex: &Vec3) -> Vec2 {
-        // let aspect_ratio = 1.0;
-        let f = self.calc_fov();
-
-        return Vec2::new(
-            vertex.x * f / vertex.z,  // / aspect_ratio
-            -vertex.y * f / vertex.z, // - = Flip Y -> 0, 0 = Top Left in Screen Space
-        );
-    }
-
-    fn old_orthographic_project(&self, vertex: &Vec3) -> Vec2 {
-        let f = self.calc_fov();
-        return Vec2::new(vertex.x * f, -vertex.y * f);
-    }
-
-    // Engine 0 : Tsoding Video
-    fn old_engine(
-        &mut self,
-        dt: f32,
-        rect: &egui::Rect,
-        painter: &egui::Painter,
-        projection_function: &dyn Fn(&Self, &Vec3) -> Vec2,
-    ) {
-        let angle = std::f32::consts::PI * dt; // 180 degrees per second
-        let sin_angle = angle.sin();
-        let cos_angle = angle.cos();
-
-        // Render Vertices
-        for vertex in &mut self.vertices {
-            if self.rotate {
-                // Maybe : StateMachine for automatic transformations
-                // Self::rotate_y(vertex, angle); // Rotate
-                Self::rotate_y_computed(vertex, sin_angle, cos_angle); // Rotate
-            }
-
-            if self.display_vertices {
-                let vertex_world_pos = self.model_position + *vertex;
-
-                if vertex_world_pos.z <= 0.0 {
-                    continue; // Skip vertices behind the camera
-                }
-
-                let vertex_pos = Self::project_simple(&vertex_world_pos);
-                let vertex_rect = Rect::from_center_size(
-                    rect.left_top()
-                        + Self::proj_to_screen(&vertex_pos, rect.width(), rect.height()),
-                    vec2(10.0, 10.0),
-                );
-                painter.rect_filled(vertex_rect, 0.0, self.stroke.color);
-            }
-        }
-
-        for face in &self.faces {
-            for i in 0..face.len() {
-                let v1_world_pos = self.model_position + self.vertices[face[i] as usize];
-                let v2_world_pos =
-                    self.model_position + self.vertices[face[(i + 1) % face.len()] as usize];
-
-                if v1_world_pos.z <= 0.0 || v2_world_pos.z <= 0.0 {
-                    continue; // Skip vertices behind the camera
-                }
-
-                let p1 = Self::proj_to_screen(
-                    &projection_function(&self, &v1_world_pos),
-                    rect.width(),
-                    rect.height(),
-                );
-                let p2 = Self::proj_to_screen(
-                    &projection_function(&self, &v2_world_pos),
-                    rect.width(),
-                    rect.height(),
-                );
-
-                painter.line_segment([rect.left_top() + p1, rect.left_top() + p2], self.stroke);
-            }
-        }
-    }
-
-    fn project_simple(vertex: &Vec3) -> Vec2 {
-        return Vec2::new(vertex.x / vertex.z, vertex.y / vertex.z);
-    }
-
-    // Transformations
-    // Rotations -> angle = radians
-    fn rotate_y(vertex: &mut Vec3, angle: f32) {
-        let cos_angle = angle.cos();
-        let sin_angle = angle.sin();
-        let x = vertex.x * cos_angle - vertex.z * sin_angle;
-        let z = vertex.x * sin_angle + vertex.z * cos_angle;
-        vertex.x = x;
-        vertex.z = z;
-    }
-
-    fn rotate_y_computed(vertex: &mut Vec3, sin_angle: f32, cos_angle: f32) {
-        let x = vertex.x * cos_angle - vertex.z * sin_angle;
-        let z = vertex.x * sin_angle + vertex.z * cos_angle;
-        vertex.x = x;
-        vertex.z = z;
-    }
 }
 
 impl eframe::App for ThreeDEngine {
@@ -686,12 +494,6 @@ impl eframe::App for ThreeDEngine {
             ui.horizontal(|ui| {
                 // Import OBJ
                 if ui.button("Import OBJ").clicked() {
-                    // let file = Self::pick_obj_file();
-
-                    // if let Some(path) = file {
-                    //     self.load_obj_custom(path.to_str().unwrap());
-                    // }
-
                     self.pick_obj_async();
                 }
 
