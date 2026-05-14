@@ -1,12 +1,15 @@
 [package]
-name = "three-d-engine"
+name = "odek-three-d-engine"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-eframe = "0.34.1"
+eframe = { version = "0.34.1", features = ["wgpu"] }
 egui = "0.34.1"
-glam = "0.32.1"
+glam = { version = "0.32.1", features = ["bytemuck"] } # byemuck = glam POD version
+wgpu = "29.0.3"
+bytemuck = "1.25.0"
+env_logger = "0.11.10"
 
 # Import File
 tobj = "4.0"

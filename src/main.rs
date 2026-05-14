@@ -3,19 +3,18 @@
 
 use std::vec;
 
-use eframe::egui::*;
+use eframe::{CreationContext, egui::*};
 use glam::Vec3;
+use wgpu::util::DeviceExt;
 
 // Import File
-use rfd::{AsyncFileDialog};
+use rfd::AsyncFileDialog;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 #[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
 async fn main() -> eframe::Result {
-    let mut three_d_engine = ThreeDEngine::new();
-
-    three_d_engine.cube();
+    env_logger::init(); // GPU Logs
 
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default().with_inner_size([800.0, 800.0]),
@@ -23,9 +22,10 @@ async fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "3D Engine",
+        "Odek 3D Engine",
         options,
-        Box::new(|_cc| Ok(Box::new(three_d_engine))),
+        // Box::new(|_cc| Ok(Box::new(three_d_engine))),
+        Box::new(|_cc| Ok(Box::new(OdekEngine::new(_cc)))),
     )
 }
 
@@ -33,7 +33,7 @@ async fn main() -> eframe::Result {
 fn main() {
     use eframe::wasm_bindgen::JsCast as _;
 
-    let mut three_d_engine = ThreeDEngine::new();
+    let mut three_d_engine = OdekEngine::new();
     three_d_engine.cube();
 
     // Redirect `log` message to `console.log` and friends:
@@ -105,7 +105,29 @@ impl Bindings {
     }
 }
 
-struct ThreeDEngine {
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Vertex {
+    pub position: [f32; 3],
+}
+
+impl Vertex {
+    fn new(x: f32, y: f32, z: f32) -> Self {
+        Self {
+            position: [x, y, z],
+        }
+    }
+}
+
+#[repr(C)] // Prevent rust from reordering struct fields - Memory Layout need to be clean for GPU
+// #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ModelData {
+    // vertices: Vec<glam::Vec3>,
+    vertices: Vec<Vertex>,
+    faces: Vec<Vec<u16>>,
+}
+
+struct OdekEngine {
     // RENDERING
     // TODO : Store Radians instead of Degrees (Performance)
     smoothed_fps: f32,
@@ -130,17 +152,62 @@ struct ThreeDEngine {
     scale: bool,
     translate_osciallator: f32,
     scale_osciallator: f32,
-    // MODEL DATA
-    // TODO : Separate Data / Engine
+    // ENGINE DATA
+    vertex_buffer: wgpu::Buffer,
+    mvp_buffer: wgpu::Buffer,
+    wgpu_queue: std::sync::Arc<wgpu::Queue>,
+    wgpu_device: wgpu::Device,
     tx: Sender<Vec<u8>>,
     rx: Receiver<Vec<u8>>,
-    vertices: Vec<glam::Vec3>,
-    faces: Vec<Vec<u16>>, // TODO : Triangulate + Flatten
+    model_data: ModelData,
 }
 
-impl ThreeDEngine {
-    fn new() -> Self {
+impl OdekEngine {
+    fn new(cc: &CreationContext) -> Self {
+        let cube = Self::cube_2();
+
+        // Communication Channel for Async File Loading
         let (tx, rx) = channel::<Vec<u8>>();
+
+        // GPU Setup
+        let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("wgpu not enabled!");
+        let wgpu_device = wgpu_render_state.device.clone();
+        let wgpu_queue: std::sync::Arc<wgpu::Queue> =
+            std::sync::Arc::new(wgpu_render_state.queue.clone());
+
+        // Shader
+        let shader = wgpu_device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("vertex_shader.wgsl").into()),
+        });
+
+        // Pipeline
+
+        // Create Vertex Buffer
+        let vertex_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&cube.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        // Create MVP Buffer
+        let identity_matrix = glam::Mat4::IDENTITY;
+
+        let mvp_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MVP Uniform Buffer"),
+            contents: bytemuck::cast_slice(&identity_matrix.to_cols_array()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Bind Group
+        // let bind_group = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
+        //     layout: &bind_group_layout,
+        //     entries: &[wgpu::BindGroupEntry {
+        //         binding: 0,
+        //         resource: mvp_buffer.as_entire_binding(),
+        //     }],
+        //     label: Some("mvp_bind_group"),
+        // });
 
         Self {
             // CAMERA
@@ -167,11 +234,14 @@ impl ThreeDEngine {
             scale: false,
             translate_osciallator: 0.0,
             scale_osciallator: 0.0,
-            // MODEL DATA
+            // ENGINE DATA
+            vertex_buffer,
+            mvp_buffer,
+            wgpu_queue,
+            wgpu_device,
             tx,
             rx,
-            vertices: Vec::new(),
-            faces: Vec::new(),
+            model_data: cube,
         }
     }
 
@@ -230,7 +300,7 @@ impl ThreeDEngine {
         }
 
         // Render Edges
-        for face in &self.faces {
+        for face in &self.model_data.faces {
             for i in 0..face.len() {
                 self.render_edge(
                     &rect,
@@ -243,10 +313,7 @@ impl ThreeDEngine {
     }
 
     // Base Model -> Model Matrix (Model & Transformations) + View/Camera + Projection -> 2D Frustum (Projection) -> Screen Space
-    fn frame_image(
-        &self,
-        rect: &egui::Rect,
-    ) -> Vec<Option<egui::Vec2>> {
+    fn frame_image(&self, rect: &egui::Rect) -> Vec<Option<egui::Vec2>> {
         // 1) Model Matrix = Model + Transformations
         let model = glam::Mat4::from_scale_rotation_translation(
             self.model_scale,
@@ -277,11 +344,21 @@ impl ThreeDEngine {
         // 4) Apply Matrices : Model -> View -> Projection
         let mvp: glam::Mat4 = projection * view * model;
 
+        // Send MVP to GPU every frame
+        self.wgpu_queue.write_buffer(
+            &self.mvp_buffer,
+            0,
+            bytemuck::cast_slice(&mvp.to_cols_array()),
+        );
+
         return self
+            .model_data
             .vertices
             .iter()
             .map(|v| {
-                let world_v: Vec3 = mvp.project_point3(*v); // World Vertex
+                // let world_v: Vec3 = mvp.project_point3(*v); // World Vertex
+                let world_v: Vec3 =
+                    mvp.project_point3(Vec3::new(v.position[0], v.position[1], v.position[2])); // World Vertex
 
                 // 5) Projection
                 let is_in_fov =
@@ -295,13 +372,8 @@ impl ThreeDEngine {
                     fulcrum_point = self.orthographic_project(&world_v);
                 }
 
-                return (is_in_fov).then(|| {
-                    Self::proj_to_screen(
-                        &fulcrum_point,
-                        rect.width(),
-                        rect.height(),
-                    )
-                });
+                return (is_in_fov)
+                    .then(|| Self::proj_to_screen(&fulcrum_point, rect.width(), rect.height()));
             })
             .collect();
     }
@@ -378,8 +450,66 @@ impl ThreeDEngine {
         ];
 
         // Engine Setup
-        self.vertices = vertices;
-        self.faces = faces;
+        // self.vertices = vertices;
+        // self.faces = faces;
+    }
+
+    fn cube_2() -> ModelData {
+        // let vertices = vec![
+        //     // Front Face
+        //     Vec3::new(0.25, 0.25, 0.25),
+        //     Vec3::new(-0.25, 0.25, 0.25),
+        //     Vec3::new(-0.25, -0.25, 0.25),
+        //     Vec3::new(0.25, -0.25, 0.25),
+        //     // Back Face
+        //     Vec3::new(0.25, 0.25, -0.25),
+        //     Vec3::new(-0.25, 0.25, -0.25),
+        //     Vec3::new(-0.25, -0.25, -0.25),
+        //     Vec3::new(0.25, -0.25, -0.25),
+        // ];
+
+        let vertices = vec![
+            // Front Face
+            Vertex::new(0.25, 0.25, 0.25),
+            Vertex::new(-0.25, 0.25, 0.25),
+            Vertex::new(-0.25, -0.25, 0.25),
+            Vertex::new(0.25, -0.25, 0.25),
+            // Back Face
+            Vertex::new(0.25, 0.25, -0.25),
+            Vertex::new(-0.25, 0.25, -0.25),
+            Vertex::new(-0.25, -0.25, -0.25),
+            Vertex::new(0.25, -0.25, -0.25),
+        ];
+
+        let faces: Vec<Vec<u16>> = vec![
+            vec![0, 1, 2, 3], // Front
+            vec![4, 5, 6, 7], // Back
+            vec![0, 4],
+            vec![1, 5],
+            vec![2, 6],
+            vec![3, 7],
+            // Full Faces
+            // vec![0, 4, 7, 3], // Right
+            // vec![1, 5, 6, 2], // Left
+            // vec![0, 1, 5, 4], // Top
+            // vec![3, 2, 6, 7], // Bottom
+        ];
+
+        return ModelData { vertices, faces };
+    }
+
+    fn set_model(&mut self, model_data: ModelData) {
+        let vertex_buffer =
+            self.wgpu_device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Vertex Buffer"),
+                    contents: bytemuck::cast_slice(&model_data.vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+
+        self.vertex_buffer = vertex_buffer;
+
+        self.model_data = model_data;
     }
 
     fn hud(&mut self, rect: &egui::Rect, painter: &egui::Painter, fps: f32) {
@@ -457,10 +587,16 @@ impl ThreeDEngine {
 
     fn load_mesh(&mut self, mesh: &tobj::Mesh) {
         // 1. Convert flat f32 vec [x,y,z, x,y,z] to Vec<Vec3>
-        let vertices: Vec<Vec3> = mesh
+        // let vertices: Vec<Vec3> = mesh
+        //     .positions
+        //     .chunks_exact(3)
+        //     .map(|p| Vec3::new(p[0], p[1], p[2]))
+        //     .collect();
+
+        let vertices: Vec<Vertex> = mesh
             .positions
             .chunks_exact(3)
-            .map(|p| Vec3::new(p[0], p[1], p[2]))
+            .map(|p| Vertex::new(p[0], p[1], p[2]))
             .collect();
 
         // 2. Convert flat indices [0,1,2, 3,4,5] to Vec<Vec<u8>>
@@ -470,12 +606,12 @@ impl ThreeDEngine {
             .map(|f| f.iter().map(|&i| i as u16).collect())
             .collect();
 
-        self.vertices = vertices;
-        self.faces = faces;
+        // self.model_data = ModelData { vertices, faces };
+        self.set_model(ModelData { vertices, faces });
     }
 }
 
-impl eframe::App for ThreeDEngine {
+impl eframe::App for OdekEngine {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             // ui.request_repaint();
@@ -499,8 +635,14 @@ impl eframe::App for ThreeDEngine {
 
                 // Reset Scene
                 if ui.button("Reset Scene").clicked() {
-                    *self = Self::new();
-                    self.cube();
+                    self.camera_position = Vec3::new(0.0, 0.0, -1.0);
+                    self.camera_rotation = Vec3::new(0.0, 180.0, 0.0);
+
+                    self.model_position = Vec3::new(0.0, 0.0, 0.0);
+                    self.model_rotation = Vec3::new(0.0, 0.0, 0.0);
+                    self.model_scale = Vec3::new(1.0, 1.0, 1.0);
+
+                    self.set_model(Self::cube_2());
                 }
 
                 // Rendering Settings
@@ -552,7 +694,8 @@ impl eframe::App for ThreeDEngine {
                     egui::DragValue::new(&mut self.model_rotation.x)
                         .prefix("X: ")
                         .speed(0.05)
-                        .range(-360.0..=360.0),
+                        .range(-360.0..=360.0)
+                        .custom_formatter(|n, _| format!("{n:.2}")),
                 );
 
                 // if response.changed() {
@@ -564,13 +707,15 @@ impl eframe::App for ThreeDEngine {
                     egui::DragValue::new(&mut self.model_rotation.y)
                         .prefix("Y: ")
                         .speed(0.05)
-                        .range(-360.0..=360.0),
+                        .range(-360.0..=360.0)
+                        .custom_formatter(|n, _| format!("{n:.2}")),
                 );
                 ui.add(
                     egui::DragValue::new(&mut self.model_rotation.z)
                         .prefix("Z: ")
                         .speed(0.05)
-                        .range(-360.0..=360.0),
+                        .range(-360.0..=360.0)
+                        .custom_formatter(|n, _| format!("{n:.2}")),
                 );
 
                 // Model Scale
