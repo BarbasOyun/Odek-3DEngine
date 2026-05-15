@@ -24,7 +24,6 @@ async fn main() -> eframe::Result {
     eframe::run_native(
         "Odek 3D Engine",
         options,
-        // Box::new(|_cc| Ok(Box::new(three_d_engine))),
         Box::new(|_cc| Ok(Box::new(OdekEngine::new(_cc)))),
     )
 }
@@ -109,12 +108,14 @@ impl Bindings {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub position: [f32; 3],
+    pub _padding: f32, // 16 bytes
 }
 
 impl Vertex {
     fn new(x: f32, y: f32, z: f32) -> Self {
         Self {
             position: [x, y, z],
+            _padding: 0.0,
         }
     }
 }
@@ -153,10 +154,15 @@ struct OdekEngine {
     translate_osciallator: f32,
     scale_osciallator: f32,
     // ENGINE DATA
-    vertex_buffer: wgpu::Buffer,
+    // vertex_buffer: wgpu::Buffer,
     mvp_buffer: wgpu::Buffer,
     wgpu_queue: std::sync::Arc<wgpu::Queue>,
     wgpu_device: wgpu::Device,
+    compute_pipeline: wgpu::ComputePipeline,
+    compute_bind_group: wgpu::BindGroup,
+    output_buffer: wgpu::Buffer,
+    staging_buffer: wgpu::Buffer,
+    buffer_size: wgpu::BufferAddress,
     tx: Sender<Vec<u8>>,
     rx: Receiver<Vec<u8>>,
     model_data: ModelData,
@@ -164,7 +170,7 @@ struct OdekEngine {
 
 impl OdekEngine {
     fn new(cc: &CreationContext) -> Self {
-        let cube = Self::cube_2();
+        let cube = Self::cube();
 
         // Communication Channel for Async File Loading
         let (tx, rx) = channel::<Vec<u8>>();
@@ -177,20 +183,11 @@ impl OdekEngine {
 
         // Shader
         let shader = wgpu_device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("vertex_shader.wgsl").into()),
+            label: Some("Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("compute.wgsl").into()),
         });
 
-        // Pipeline
-
-        // Create Vertex Buffer
-        let vertex_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&cube.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        // Create MVP Buffer
+        // MVP Buffer
         let identity_matrix = glam::Mat4::IDENTITY;
 
         let mvp_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -199,15 +196,110 @@ impl OdekEngine {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Bind Group
-        // let bind_group = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
-        //     layout: &bind_group_layout,
-        //     entries: &[wgpu::BindGroupEntry {
-        //         binding: 0,
-        //         resource: mvp_buffer.as_entire_binding(),
-        //     }],
-        //     label: Some("mvp_bind_group"),
-        // });
+        // Create Vertex Buffer
+        let input_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&cube.vertices),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Output buffer
+        let buffer_size =
+            (cube.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
+
+        let output_buffer = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Output Vertex Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Staging buffer
+        let staging_buffer = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Bind group layout
+        let bind_group_layout =
+            wgpu_device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Compute Bind Group Layout"),
+                entries: &[
+                    // MVP Uniform
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Input Storage
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Output Storage
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        // Bind group
+        let compute_bind_group = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: mvp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: input_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Compute Pipeline
+        let pipeline_layout = wgpu_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Compute Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            // push_constant_ranges: &[],
+            immediate_size: 0,
+        });
+
+        let compute_pipeline =
+            wgpu_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         Self {
             // CAMERA
@@ -235,10 +327,15 @@ impl OdekEngine {
             translate_osciallator: 0.0,
             scale_osciallator: 0.0,
             // ENGINE DATA
-            vertex_buffer,
+            // vertex_buffer,
             mvp_buffer,
             wgpu_queue,
             wgpu_device,
+            compute_pipeline,
+            compute_bind_group,
+            output_buffer,
+            staging_buffer,
+            buffer_size,
             tx,
             rx,
             model_data: cube,
@@ -288,7 +385,7 @@ impl OdekEngine {
 
     // RENDERING
 
-    // Wireframe Rendering -> New Engine : Generate Frame Image
+    // Wireframe Rendering
     fn render_frame(&self, rect: &egui::Rect, painter: &egui::Painter) {
         let screen_points: Vec<Option<egui::Vec2>> = self.frame_image(&rect);
 
@@ -312,7 +409,7 @@ impl OdekEngine {
         }
     }
 
-    // Base Model -> Model Matrix (Model & Transformations) + View/Camera + Projection -> 2D Frustum (Projection) -> Screen Space
+    // Base Model -> Model Matrix (Model & Transformations) * View/Camera * Projection -> 2D Frustum (Projection) -> Screen Space
     fn frame_image(&self, rect: &egui::Rect) -> Vec<Option<egui::Vec2>> {
         // 1) Model Matrix = Model + Transformations
         let model = glam::Mat4::from_scale_rotation_translation(
@@ -350,6 +447,73 @@ impl OdekEngine {
             0,
             bytemuck::cast_slice(&mvp.to_cols_array()),
         );
+
+        let mut encoder = self
+            .wgpu_device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.compute_pipeline);
+            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+
+            let vertex_count = self.model_data.vertices.len() as u32;
+            let workgroup_count = (vertex_count + 63) / 64;
+            compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
+        }
+
+        // output_buffer -> staging_buffer
+        encoder.copy_buffer_to_buffer(
+            &self.output_buffer,
+            0,
+            &self.staging_buffer,
+            0,
+            self.buffer_size,
+        );
+
+        self.wgpu_queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = self.staging_buffer.slice(..);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+
+        self.wgpu_device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        if let Ok(Ok(())) = receiver.recv() {
+            let data = buffer_slice.get_mapped_range();
+
+            let output_vertices: &[Vertex] = bytemuck::cast_slice(&data);
+
+            let proj_vertices = output_vertices.iter().map(|v| {
+                let world_v = Vec3::new(v.position[0], v.position[1], v.position[2]);
+
+                // 5) Projection
+                let is_in_fov =
+                    world_v.x.abs() <= 1.0 && world_v.y.abs() <= 1.0 && world_v.z.abs() <= 1.0;
+
+                let fulcrum_point: Vec2;
+
+                if self.perspective {
+                    fulcrum_point = self.perspective_project(&world_v);
+                } else {
+                    fulcrum_point = self.orthographic_project(&world_v);
+                }
+
+                return (is_in_fov)
+                    .then(|| Self::proj_to_screen(&fulcrum_point, rect.width(), rect.height()));
+            }).collect();
+
+            drop(data);
+            self.staging_buffer.unmap();
+
+            return proj_vertices;
+        }
 
         return self
             .model_data
@@ -421,40 +585,7 @@ impl OdekEngine {
 
     // UTILS
 
-    fn cube(&mut self) {
-        let vertices = vec![
-            // Front Face
-            Vec3::new(0.25, 0.25, 0.25),
-            Vec3::new(-0.25, 0.25, 0.25),
-            Vec3::new(-0.25, -0.25, 0.25),
-            Vec3::new(0.25, -0.25, 0.25),
-            // Back Face
-            Vec3::new(0.25, 0.25, -0.25),
-            Vec3::new(-0.25, 0.25, -0.25),
-            Vec3::new(-0.25, -0.25, -0.25),
-            Vec3::new(0.25, -0.25, -0.25),
-        ];
-
-        let faces: Vec<Vec<u16>> = vec![
-            vec![0, 1, 2, 3], // Front
-            vec![4, 5, 6, 7], // Back
-            vec![0, 4],
-            vec![1, 5],
-            vec![2, 6],
-            vec![3, 7],
-            // Full Faces
-            // vec![0, 4, 7, 3], // Right
-            // vec![1, 5, 6, 2], // Left
-            // vec![0, 1, 5, 4], // Top
-            // vec![3, 2, 6, 7], // Bottom
-        ];
-
-        // Engine Setup
-        // self.vertices = vertices;
-        // self.faces = faces;
-    }
-
-    fn cube_2() -> ModelData {
+    fn cube() -> ModelData {
         // let vertices = vec![
         //     // Front Face
         //     Vec3::new(0.25, 0.25, 0.25),
@@ -507,7 +638,7 @@ impl OdekEngine {
                     usage: wgpu::BufferUsages::VERTEX,
                 });
 
-        self.vertex_buffer = vertex_buffer;
+        // self.vertex_buffer = vertex_buffer;
 
         self.model_data = model_data;
     }
@@ -609,6 +740,107 @@ impl OdekEngine {
         // self.model_data = ModelData { vertices, faces };
         self.set_model(ModelData { vertices, faces });
     }
+
+    // FUTURE ENGINE : GPU Render pipeline
+
+    fn future_engine() {
+        // let shader_module = wgpu_device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        //     label: Some("Shader"),
+        //     source: wgpu::ShaderSource::Wgsl(include_str!("vertex_shader.wgsl").into()),
+        // });
+
+        // // Create Vertex Buffer
+        // let vertex_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        //     label: Some("Vertex Buffer"),
+        //     contents: bytemuck::cast_slice(&cube.vertices),
+        //     usage: wgpu::BufferUsages::VERTEX,
+        // });
+
+        // // Create MVP Buffer
+        // let identity_matrix = glam::Mat4::IDENTITY;
+
+        // let mvp_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        //     label: Some("MVP Uniform Buffer"),
+        //     contents: bytemuck::cast_slice(&identity_matrix.to_cols_array()),
+        //     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        // });
+
+        // let render_pipeline = Self::gpu_pipeline(&wgpu_device, &mvp_buffer, &shader_module);
+    }
+
+    fn gpu_pipeline(
+        wgpu_device: &wgpu::Device,
+        mvp_buffer: &wgpu::Buffer,
+        shader_module: &wgpu::ShaderModule,
+    ) {
+        // -> wgpu::RenderPipeline
+        // Bind Group -> MVP
+        let bind_group_layout =
+            wgpu_device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("mvp_bind_group_layout"),
+            });
+
+        let bind_group = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: mvp_buffer.as_entire_binding(),
+            }],
+            label: Some("mvp_bind_group"),
+        });
+
+        // Vertex buffer layout
+        let vertex_buffer_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0, // @location(0) in vertex_shader.wgsl
+                format: wgpu::VertexFormat::Float32x3,
+            }],
+        };
+
+        let pipeline_layout = wgpu_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            // push_constant_ranges: &[],
+            immediate_size: 0,
+        });
+
+        // let render_pipeline = wgpu_device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        //     label: Some("Render Pipeline"),
+        //     layout: Some(&pipeline_layout),
+        //     vertex: wgpu::VertexState {
+        //         module: &shader_module,
+        //         entry_point: Some("vs_main"),
+        //         compilation_options: Default::default(),
+        //         buffers: &[vertex_buffer_layout],
+        //     },
+        //     fragment: Some(wgpu::FragmentState {
+        //         module: &shader_module,
+        //         entry_point: Some("fs_main"),
+        //         compilation_options: Default::default(),
+        //         targets: &[Some(wgpu::ColorTargetState {
+        //             format: wgpu::TextureFormat::Bgra8UnormSrgb, // Match the surface format
+        //             blend: Some(wgpu::BlendState::REPLACE),
+        //             write_mask: wgpu::ColorWrites::ALL,
+        //         })],
+        //     }),
+        //     // ... primitive, depth_stencil, and multisample settings
+        // });
+
+        // return render_pipeline;
+    }
 }
 
 impl eframe::App for OdekEngine {
@@ -642,7 +874,7 @@ impl eframe::App for OdekEngine {
                     self.model_rotation = Vec3::new(0.0, 0.0, 0.0);
                     self.model_scale = Vec3::new(1.0, 1.0, 1.0);
 
-                    self.set_model(Self::cube_2());
+                    self.set_model(Self::cube());
                 }
 
                 // Rendering Settings
