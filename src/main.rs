@@ -128,6 +128,21 @@ struct ModelData {
     faces: Vec<Vec<u16>>,
 }
 
+struct GPUData {
+    wgpu_device: wgpu::Device,
+    wgpu_queue: std::sync::Arc<wgpu::Queue>,
+    // Buffers
+    mvp_buffer: wgpu::Buffer,
+    input_buffer: wgpu::Buffer,
+    output_buffer: wgpu::Buffer,
+    staging_buffer: wgpu::Buffer,
+    buffer_size: wgpu::BufferAddress,
+    // Pipeline
+    compute_pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    compute_bind_group: wgpu::BindGroup,
+}
+
 struct OdekEngine {
     // RENDERING
     // TODO : Store Radians instead of Degrees (Performance)
@@ -141,6 +156,7 @@ struct OdekEngine {
     stroke: Stroke,
     perspective: bool,
     display_vertices: bool,
+    three_d_viewport: egui::Rect,
     // LOGIC : Transformations
     bindings: Bindings,
     azerty: bool,
@@ -154,18 +170,10 @@ struct OdekEngine {
     translate_osciallator: f32,
     scale_osciallator: f32,
     // ENGINE DATA
-    // vertex_buffer: wgpu::Buffer,
-    mvp_buffer: wgpu::Buffer,
-    wgpu_queue: std::sync::Arc<wgpu::Queue>,
-    wgpu_device: wgpu::Device,
-    compute_pipeline: wgpu::ComputePipeline,
-    compute_bind_group: wgpu::BindGroup,
-    output_buffer: wgpu::Buffer,
-    staging_buffer: wgpu::Buffer,
-    buffer_size: wgpu::BufferAddress,
+    model_data: ModelData,
     tx: Sender<Vec<u8>>,
     rx: Receiver<Vec<u8>>,
-    model_data: ModelData,
+    gpu_data: GPUData,
 }
 
 impl OdekEngine {
@@ -175,131 +183,7 @@ impl OdekEngine {
         // Communication Channel for Async File Loading
         let (tx, rx) = channel::<Vec<u8>>();
 
-        // GPU Setup
-        let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("wgpu not enabled!");
-        let wgpu_device = wgpu_render_state.device.clone();
-        let wgpu_queue: std::sync::Arc<wgpu::Queue> =
-            std::sync::Arc::new(wgpu_render_state.queue.clone());
-
-        // Shader
-        let shader = wgpu_device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Compute Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("compute.wgsl").into()),
-        });
-
-        // MVP Buffer
-        let identity_matrix = glam::Mat4::IDENTITY;
-
-        let mvp_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MVP Uniform Buffer"),
-            contents: bytemuck::cast_slice(&identity_matrix.to_cols_array()),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // Create Vertex Buffer
-        let input_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&cube.vertices),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // Output buffer
-        let buffer_size =
-            (cube.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
-
-        let output_buffer = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Output Vertex Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // Staging buffer
-        let staging_buffer = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Bind group layout
-        let bind_group_layout =
-            wgpu_device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Compute Bind Group Layout"),
-                entries: &[
-                    // MVP Uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    // Input Storage
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    // Output Storage
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        // Bind group
-        let compute_bind_group = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: mvp_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: input_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: output_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Compute Pipeline
-        let pipeline_layout = wgpu_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Compute Pipeline Layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            // push_constant_ranges: &[],
-            immediate_size: 0,
-        });
-
-        let compute_pipeline =
-            wgpu_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Compute Pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+        let gpu_data = Self::gpu_setup(cc, &cube);
 
         Self {
             // CAMERA
@@ -314,6 +198,7 @@ impl OdekEngine {
             stroke: egui::Stroke::new(2.0, egui::Color32::from_rgb(190, 110, 40)),
             perspective: true,
             display_vertices: true,
+            three_d_viewport: cc.egui_ctx.content_rect(),
             // LOGIC : Inputs
             bindings: Bindings::qwerty(),
             azerty: false,
@@ -327,18 +212,10 @@ impl OdekEngine {
             translate_osciallator: 0.0,
             scale_osciallator: 0.0,
             // ENGINE DATA
-            // vertex_buffer,
-            mvp_buffer,
-            wgpu_queue,
-            wgpu_device,
-            compute_pipeline,
-            compute_bind_group,
-            output_buffer,
-            staging_buffer,
-            buffer_size,
+            model_data: cube,
             tx,
             rx,
-            model_data: cube,
+            gpu_data,
         }
     }
 
@@ -385,14 +262,237 @@ impl OdekEngine {
 
     // RENDERING
 
+    // GPU Computing
+    fn gpu_setup(cc: &CreationContext, model: &ModelData) -> GPUData {
+        let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("wgpu not enabled!");
+        let wgpu_device = wgpu_render_state.device.clone();
+        let wgpu_queue: std::sync::Arc<wgpu::Queue> =
+            std::sync::Arc::new(wgpu_render_state.queue.clone());
+
+        // Shader
+        let shader = wgpu_device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("compute.wgsl").into()),
+        });
+
+        // MVP Buffer
+        let identity_matrix = glam::Mat4::IDENTITY;
+
+        let mvp_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MVP Uniform Buffer"),
+            contents: bytemuck::cast_slice(&identity_matrix.to_cols_array()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Bind group layout
+        let bind_group_layout =
+            wgpu_device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Compute Bind Group Layout"),
+                entries: &[
+                    // MVP Uniform
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Input Storage
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Output Storage
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let (input_buffer, output_buffer, staging_buffer, buffer_size, compute_bind_group) =
+            Self::gpu_setup_model(
+                &wgpu_device,
+                &bind_group_layout,
+                &mvp_buffer,
+                &model,
+            );
+
+        // Compute Pipeline
+        let pipeline_layout = wgpu_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Compute Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let compute_pipeline =
+            wgpu_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        return GPUData {
+            wgpu_device,
+            wgpu_queue,
+            mvp_buffer,
+            input_buffer,
+            output_buffer,
+            staging_buffer,
+            buffer_size,
+            compute_pipeline,
+            bind_group_layout,
+            compute_bind_group,
+        };
+    }
+
+    fn gpu_setup_model(
+        wgpu_device: &wgpu::Device,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        mvp_buffer: &wgpu::Buffer,
+        model: &ModelData,
+    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, u64, wgpu::BindGroup) {
+        // Input Buffer
+        let input_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&model.vertices),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let buffer_size =
+            (model.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
+
+        // Output buffer
+        let output_buffer = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Output Vertex Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Staging buffer
+        let staging_buffer = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Bind group
+        let compute_bind_group = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: mvp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: input_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        return (
+            input_buffer,
+            output_buffer,
+            staging_buffer,
+            buffer_size,
+            compute_bind_group,
+        );
+    }
+
+    fn gpu_compute(
+        &self,
+        mvp: glam::Mat4,
+    ) -> (
+        Receiver<Result<(), wgpu::BufferAsyncError>>,
+        wgpu::BufferSlice<'_>,
+    ) {
+        // Called Every frame
+        let gpu_data = &self.gpu_data;
+
+        // Send MVP to GPU
+        gpu_data.wgpu_queue.write_buffer(
+            &gpu_data.mvp_buffer,
+            0,
+            bytemuck::cast_slice(&mvp.to_cols_array()),
+        );
+
+        let mut encoder = gpu_data
+            .wgpu_device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&gpu_data.compute_pipeline);
+            compute_pass.set_bind_group(0, &gpu_data.compute_bind_group, &[]);
+
+            let vertex_count = self.model_data.vertices.len() as u32;
+            let workgroup_count = (vertex_count + 63) / 64;
+            compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
+        }
+
+        // output_buffer -> staging_buffer
+        encoder.copy_buffer_to_buffer(
+            &gpu_data.output_buffer,
+            0,
+            &gpu_data.staging_buffer,
+            0,
+            gpu_data.buffer_size,
+        );
+
+        gpu_data.wgpu_queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = gpu_data.staging_buffer.slice(..);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+
+        gpu_data
+            .wgpu_device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+
+        return (receiver, buffer_slice);
+    }
+
     // Wireframe Rendering
-    fn render_frame(&self, rect: &egui::Rect, painter: &egui::Painter) {
-        let screen_points: Vec<Option<egui::Vec2>> = self.frame_image(&rect);
+    fn render_frame(&self, painter: &egui::Painter) {
+        let screen_points: Vec<Option<egui::Vec2>> = self.frame_image();
 
         // Render Vertices
         if self.display_vertices {
             for point in &screen_points {
-                self.render_vertex(&rect, &painter, *point);
+                self.render_vertex(&painter, *point);
             }
         }
 
@@ -400,7 +500,6 @@ impl OdekEngine {
         for face in &self.model_data.faces {
             for i in 0..face.len() {
                 self.render_edge(
-                    &rect,
                     &painter,
                     screen_points[face[i] as usize],
                     screen_points[face[(i + 1) % face.len()] as usize],
@@ -410,7 +509,7 @@ impl OdekEngine {
     }
 
     // Base Model -> Model Matrix (Model & Transformations) * View/Camera * Projection -> 2D Frustum (Projection) -> Screen Space
-    fn frame_image(&self, rect: &egui::Rect) -> Vec<Option<egui::Vec2>> {
+    fn frame_image(&self) -> Vec<Option<egui::Vec2>> {
         // 1) Model Matrix = Model + Transformations
         let model = glam::Mat4::from_scale_rotation_translation(
             self.model_scale,
@@ -441,115 +540,73 @@ impl OdekEngine {
         // 4) Apply Matrices : Model -> View -> Projection
         let mvp: glam::Mat4 = projection * view * model;
 
-        // Send MVP to GPU every frame
-        self.wgpu_queue.write_buffer(
-            &self.mvp_buffer,
-            0,
-            bytemuck::cast_slice(&mvp.to_cols_array()),
-        );
+        // 5) Projection : GPU Computing + CPU Fallback
 
-        let mut encoder = self
-            .wgpu_device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.compute_pipeline);
-            compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
-
-            let vertex_count = self.model_data.vertices.len() as u32;
-            let workgroup_count = (vertex_count + 63) / 64;
-            compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
-        }
-
-        // output_buffer -> staging_buffer
-        encoder.copy_buffer_to_buffer(
-            &self.output_buffer,
-            0,
-            &self.staging_buffer,
-            0,
-            self.buffer_size,
-        );
-
-        self.wgpu_queue.submit(Some(encoder.finish()));
-
-        let buffer_slice = self.staging_buffer.slice(..);
-
-        let (sender, receiver) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
-        });
-
-        self.wgpu_device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        // GPU
+        let (receiver, buffer_slice) = self.gpu_compute(mvp);
 
         if let Ok(Ok(())) = receiver.recv() {
             let data = buffer_slice.get_mapped_range();
-
             let output_vertices: &[Vertex] = bytemuck::cast_slice(&data);
 
-            let proj_vertices = output_vertices.iter().map(|v| {
-                let world_v = Vec3::new(v.position[0], v.position[1], v.position[2]);
-
-                // 5) Projection
-                let is_in_fov =
-                    world_v.x.abs() <= 1.0 && world_v.y.abs() <= 1.0 && world_v.z.abs() <= 1.0;
-
-                let fulcrum_point: Vec2;
-
-                if self.perspective {
-                    fulcrum_point = self.perspective_project(&world_v);
-                } else {
-                    fulcrum_point = self.orthographic_project(&world_v);
-                }
-
-                return (is_in_fov)
-                    .then(|| Self::proj_to_screen(&fulcrum_point, rect.width(), rect.height()));
-            }).collect();
+            let proj_vertices = output_vertices
+                .iter()
+                .map(|v| {
+                    return self.vertex_projection(&v);
+                })
+                .collect();
 
             drop(data);
-            self.staging_buffer.unmap();
+            self.gpu_data.staging_buffer.unmap();
 
             return proj_vertices;
         }
 
+        // CPU
         return self
             .model_data
             .vertices
             .iter()
             .map(|v| {
-                // let world_v: Vec3 = mvp.project_point3(*v); // World Vertex
-                let world_v: Vec3 =
-                    mvp.project_point3(Vec3::new(v.position[0], v.position[1], v.position[2])); // World Vertex
+                // let world_vertex: Vec3 = mvp.project_point3(*v);
 
-                // 5) Projection
-                let is_in_fov =
-                    world_v.x.abs() <= 1.0 && world_v.y.abs() <= 1.0 && world_v.z.abs() <= 1.0;
+                let w: Vec3 = mvp.project_point3(Vec3::new(v.position[0], v.position[1], v.position[2]));
+                let world_vertex: Vertex = Vertex::new(w.x, w.y, w.z);
 
-                let fulcrum_point: Vec2;
-
-                if self.perspective {
-                    fulcrum_point = self.perspective_project(&world_v);
-                } else {
-                    fulcrum_point = self.orthographic_project(&world_v);
-                }
-
-                return (is_in_fov)
-                    .then(|| Self::proj_to_screen(&fulcrum_point, rect.width(), rect.height()));
+                return self.vertex_projection(&world_vertex);
             })
             .collect();
     }
 
-    // World -> 2D Frustum (Perspective)
-    fn perspective_project(&self, vertex: &Vec3) -> Vec2 {
-        return Vec2::new(vertex.x / vertex.z, vertex.y / vertex.z);
+    // World -> 2D Frustum
+    fn vertex_projection(&self, world_v: &Vertex) -> Option<Vec2> { // &Vec3
+        // let is_in_fov = world_v.x.abs() <= 1.0 && world_v.y.abs() <= 1.0 && world_v.z.abs() <= 1.0;
+        let is_in_fov = world_v.position[0].abs() <= 1.0 && world_v.position[1].abs() <= 1.0 && world_v.position[2].abs() <= 1.0;
+
+        let fulcrum_point: Vec2;
+
+        if self.perspective {
+            fulcrum_point = self.perspective_project(&world_v);
+        } else {
+            fulcrum_point = self.orthographic_project(&world_v);
+        }
+
+        return (is_in_fov).then(|| {
+            Self::proj_to_screen(
+                &fulcrum_point,
+                self.three_d_viewport.width(),
+                self.three_d_viewport.height(),
+            )
+        });
     }
 
-    // World -> 2D Frustum (Orthographic)
-    fn orthographic_project(&self, vertex: &Vec3) -> Vec2 {
-        return Vec2::new(vertex.x, vertex.y);
+    fn perspective_project(&self, vertex: &Vertex) -> Vec2 { // &Vec3
+        // return Vec2::new(vertex.x / vertex.z, vertex.y / vertex.z);
+        return Vec2::new(vertex.position[0] / vertex.position[2], vertex.position[1] / vertex.position[2]);
+    }
+
+    fn orthographic_project(&self, vertex: &Vertex) -> Vec2 {
+        return Vec2::new(vertex.position[0], vertex.position[1]);
     }
 
     // 2D Frustum -> Screen space
@@ -564,22 +621,23 @@ impl OdekEngine {
         return Vec2::new(x, y);
     }
 
-    fn render_vertex(&self, rect: &egui::Rect, painter: &egui::Painter, point: Option<Vec2>) {
-        if let Some(point) = point {
-            let vertex_rect = Rect::from_center_size(rect.left_top() + point, vec2(10.0, 10.0));
+    fn render_vertex(&self, painter: &egui::Painter, vertex_pos: Option<Vec2>) {
+        if let Some(point) = vertex_pos {
+            let vertex_rect =
+                Rect::from_center_size(self.three_d_viewport.left_top() + point, vec2(10.0, 10.0));
             painter.rect_filled(vertex_rect, 0.0, self.stroke.color);
         }
     }
 
-    fn render_edge(
-        &self,
-        rect: &egui::Rect,
-        painter: &egui::Painter,
-        p1: Option<Vec2>,
-        p2: Option<Vec2>,
-    ) {
+    fn render_edge(&self, painter: &egui::Painter, p1: Option<Vec2>, p2: Option<Vec2>) {
         if let (Some(p1), Some(p2)) = (p1, p2) {
-            painter.line_segment([rect.left_top() + p1, rect.left_top() + p2], self.stroke);
+            painter.line_segment(
+                [
+                    self.three_d_viewport.left_top() + p1,
+                    self.three_d_viewport.left_top() + p2,
+                ],
+                self.stroke,
+            );
         }
     }
 
@@ -629,28 +687,34 @@ impl OdekEngine {
         return ModelData { vertices, faces };
     }
 
-    fn set_model(&mut self, model_data: ModelData) {
-        let vertex_buffer =
-            self.wgpu_device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Vertex Buffer"),
-                    contents: bytemuck::cast_slice(&model_data.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
+    fn set_model(&mut self, model: ModelData) {
+        self.model_data = model;
 
-        // self.vertex_buffer = vertex_buffer;
+        let gpu_data = &self.gpu_data;
 
-        self.model_data = model_data;
+        let (input_buffer, output_buffer, staging_buffer, buffer_size, compute_bind_group) =
+            Self::gpu_setup_model(
+                &gpu_data.wgpu_device,
+                &gpu_data.bind_group_layout,
+                &gpu_data.mvp_buffer,
+                &self.model_data,
+            );
+
+        self.gpu_data.input_buffer = input_buffer;
+        self.gpu_data.output_buffer = output_buffer;
+        self.gpu_data.staging_buffer = staging_buffer;
+        self.gpu_data.buffer_size = buffer_size;
+        self.gpu_data.compute_bind_group = compute_bind_group;
     }
 
-    fn hud(&mut self, rect: &egui::Rect, painter: &egui::Painter, fps: f32) {
+    fn hud(&mut self, painter: &egui::Painter, fps: f32) {
         // Displayed on top of the 3D View
         // FPS Display
         let alpha = 0.05;
         self.smoothed_fps = (self.smoothed_fps * (1.0 - alpha)) + (fps * alpha);
 
         painter.text(
-            rect.left_top() + egui::vec2(10.0, 10.0), // 10px padding from top-left
+            self.three_d_viewport.left_top() + egui::vec2(10.0, 10.0), // 10px padding from top-left
             egui::Align2::LEFT_TOP,
             format!("FPS: {:.2}", self.smoothed_fps),
             egui::FontId::proportional(14.0),
@@ -659,7 +723,7 @@ impl OdekEngine {
 
         // Controls Display
         painter.text(
-            rect.left_top() + egui::vec2(10.0, 30.0),
+            self.three_d_viewport.left_top() + egui::vec2(10.0, 30.0),
             egui::Align2::LEFT_TOP,
             "Movement : WASD\nLook : Right Click",
             egui::FontId::proportional(14.0),
@@ -1015,6 +1079,7 @@ impl eframe::App for OdekEngine {
             let (response, painter) =
                 ui.allocate_painter(ui.available_size(), egui::Sense::hover());
             let rect = response.rect;
+            self.three_d_viewport = rect;
 
             // Border
             painter.rect_stroke(
@@ -1024,8 +1089,8 @@ impl eframe::App for OdekEngine {
                 egui::StrokeKind::Middle,
             );
 
-            self.render_frame(&rect, &painter);
-            self.hud(&rect, &painter, fps);
+            self.render_frame(&painter);
+            self.hud(&painter, fps);
         });
     }
 }

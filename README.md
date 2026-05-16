@@ -18,19 +18,21 @@
 -Move + Rotate Camera<br>
 -Import OBJ File<br>
 -Right-Handed 3D (Z forward = -Z, Camera start at 180° Y Rotation) Similar to : Blender, Godot, OpenGl, Vulkan<br>
+-GPU computing : the vertices are multiplied by the MVP matrix using the GPU<br>
 
 ## Learnings
 
 -Applied Maths : Linear Algebra, Intercept Theorem, Vector Operations (Dot Product, Cross Product), Matrix Multiplication<br>
 -Camera System<br>
--Rendering Pipeline<br>
+-Rendering Steps<br>
 -Graphics Programming in General<br>
+-Disovered GPU Computing<br>
 
 -A lot of dead code / comments but I want to keep it as exemple (Old Engine)<br>
 
 ## To Go Further
 
--Optimisations (Triangulate Faces)<br>
+-Optimisations : Triangulate Faces, ...<br>
 -Render Faces<br>
 -Calculate Face Normals<br>
 -Lighting<br>
