@@ -165,21 +165,334 @@ struct ModelData {
     faces: Vec<Vec<u16>>,
 }
 
+struct Buffering {
+    output_buffer: wgpu::Buffer,
+    staging_buffer: wgpu::Buffer,
+    is_mapping: bool,
+    mapping_receiver: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
+}
+
+// OdekGPU
 struct GPUData {
     wgpu_device: wgpu::Device,
     wgpu_queue: std::sync::Arc<wgpu::Queue>,
     // Buffers
     mvp_buffer: wgpu::Buffer,
-    input_buffer: wgpu::Buffer,
+    buffer_size: wgpu::BufferAddress,
     output_buffer: wgpu::Buffer,
     staging_buffer: wgpu::Buffer,
-    buffer_size: wgpu::BufferAddress,
     is_mapping: bool,
     mapping_receiver: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
     // Pipeline
     compute_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     compute_bind_group: wgpu::BindGroup,
+}
+
+impl GPUData {
+    fn new(cc: &CreationContext, model: &ModelData) -> Option<Self> {
+        let state: Option<&eframe::egui_wgpu::RenderState> = cc.wgpu_render_state.as_ref();
+
+        let Some(wgpu_render_state) = state else {
+            return None;
+        };
+
+        let wgpu_device = wgpu_render_state.device.clone();
+        let wgpu_queue: std::sync::Arc<wgpu::Queue> =
+            std::sync::Arc::new(wgpu_render_state.queue.clone());
+
+        // SHADER
+        let shader = wgpu_device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("compute.wgsl").into()),
+        });
+
+        // PIPELINE
+        let bind_group_layout =
+            wgpu_device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Compute Bind Group Layout"),
+                entries: &[
+                    // MVP Uniform
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Input Storage
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Output Storage
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let pipeline_layout = wgpu_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Compute Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let compute_pipeline =
+            wgpu_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Compute Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // BUFFERS
+        let buffer_size =
+            (model.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
+
+        // MVP Buffer
+        let identity_matrix = glam::Mat4::IDENTITY;
+
+        let mvp_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MVP Uniform Buffer"),
+            contents: bytemuck::cast_slice(&identity_matrix.to_cols_array()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Staging Buffer : Copy output buffer -> Staging
+        let staging_buffer = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let (output_buffer, buffer_size, compute_bind_group) =
+            Self::setup_model(&wgpu_device, &bind_group_layout, &mvp_buffer, &model);
+
+        return Some(Self {
+            wgpu_device,
+            wgpu_queue,
+            // Buffers
+            mvp_buffer,
+            buffer_size,
+            staging_buffer,
+            is_mapping: false,
+            output_buffer,
+            mapping_receiver: None,
+            // Pipeline
+            compute_pipeline,
+            bind_group_layout,
+            compute_bind_group,
+        });
+    }
+
+    fn setup_model(
+        wgpu_device: &wgpu::Device,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        mvp_buffer: &wgpu::Buffer,
+        model: &ModelData,
+    ) -> (wgpu::Buffer, u64, wgpu::BindGroup) {
+        let vertex_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&model.vertices),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let buffer_size =
+            (model.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
+
+        // Output buffer
+        let output_buffer = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Output Vertex Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Bind group
+        let compute_bind_group = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Compute Bind Group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: mvp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: vertex_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: output_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        return (output_buffer, buffer_size, compute_bind_group);
+    }
+
+    fn set_model(&mut self, model_data: &ModelData) {
+        let (output_buffer, buffer_size, compute_bind_group) = Self::setup_model(
+            &self.wgpu_device,
+            &self.bind_group_layout,
+            &self.mvp_buffer,
+            model_data,
+        );
+
+        self.output_buffer = output_buffer;
+        self.buffer_size = buffer_size;
+        self.compute_bind_group = compute_bind_group;
+    }
+
+    fn gpu_compute(&mut self, mvp: glam::Mat4, vertex_count: u32) -> Option<wgpu::BufferView> {
+        // Called Every frame
+
+        // Send MVP to GPU
+        self.wgpu_queue.write_buffer(
+            &self.mvp_buffer,
+            0,
+            bytemuck::cast_slice(&mvp.to_cols_array()),
+        );
+
+        if !self.is_mapping {
+            let mut encoder = self
+                .wgpu_device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&self.compute_pipeline);
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+
+                let workgroup_count = (vertex_count + 63) / 64;
+                compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
+            }
+
+            // output_buffer -> staging_buffer
+            encoder.copy_buffer_to_buffer(
+                &self.output_buffer,
+                0,
+                &self.staging_buffer,
+                0,
+                self.buffer_size,
+            );
+
+            self.wgpu_queue.submit(Some(encoder.finish()));
+
+            self.is_mapping = true;
+
+            let buffer_slice = self.staging_buffer.slice(..);
+            let (sender, receiver) = std::sync::mpsc::channel();
+
+            buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+
+            self.mapping_receiver = Some(receiver);
+        }
+
+        if let Some(receiver) = &self.mapping_receiver {
+            if let Ok(Ok(())) = receiver.try_recv() {
+                let buffer_slice = self.staging_buffer.slice(..);
+                let data = buffer_slice.get_mapped_range();
+
+                self.mapping_receiver = None;
+                self.is_mapping = false;
+
+                return Some(data);
+            }
+        }
+
+        return None;
+    }
+
+    fn double_buffering(&mut self, mvp: glam::Mat4, vertex_count: u32) -> Option<wgpu::BufferView> {
+        // Send MVP to GPU
+        self.wgpu_queue.write_buffer(
+            &self.mvp_buffer,
+            0,
+            bytemuck::cast_slice(&mvp.to_cols_array()),
+        );
+
+        if !self.is_mapping {
+            let mut encoder = self
+                .wgpu_device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&self.compute_pipeline);
+                compute_pass.set_bind_group(0, &self.compute_bind_group, &[]);
+
+                // let vertex_count = self.model_data.vertices.len() as u32;
+                let workgroup_count = (vertex_count + 63) / 64;
+                compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
+            }
+
+            // output_buffer -> staging_buffer
+            encoder.copy_buffer_to_buffer(
+                &self.output_buffer,
+                0,
+                &self.staging_buffer,
+                0,
+                self.buffer_size,
+            );
+
+            self.wgpu_queue.submit(Some(encoder.finish()));
+
+            self.is_mapping = true;
+
+            let buffer_slice = self.staging_buffer.slice(..);
+            let (sender, receiver) = std::sync::mpsc::channel();
+
+            buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+                // sender.send(result).unwrap();
+                let _ = sender.send(result);
+            });
+
+            self.mapping_receiver = Some(receiver);
+        }
+
+        if let Some(receiver) = &self.mapping_receiver {
+            if let Ok(Ok(())) = receiver.try_recv() {
+                let buffer_slice = self.staging_buffer.slice(..);
+                let data = buffer_slice.get_mapped_range();
+
+                self.mapping_receiver = None;
+                self.is_mapping = false;
+
+                return Some(data);
+            }
+        }
+
+        return None;
+    }
 }
 
 struct OdekEngine {
@@ -224,9 +537,9 @@ impl OdekEngine {
         // Communication Channel for Async File Loading
         let (tx, rx) = channel::<Vec<u8>>();
 
-        let gpu_data = Self::gpu_setup(cc, &cube);
+        let gpu_data = GPUData::new(cc, &cube);
 
-        Self {
+        return Self {
             // RENDERING
             gpu_computing: false,
             three_d_viewport: cc.egui_ctx.content_rect(),
@@ -258,7 +571,7 @@ impl OdekEngine {
             tx,
             rx,
             gpu_data,
-        }
+        };
     }
 
     // LOGIC : Transformations
@@ -303,250 +616,6 @@ impl OdekEngine {
     }
 
     // RENDERING
-
-    // GPU Computing
-    fn gpu_setup(cc: &CreationContext, model: &ModelData) -> Option<GPUData> {
-        let state: Option<&eframe::egui_wgpu::RenderState> = cc.wgpu_render_state.as_ref();
-
-        let Some(wgpu_render_state) = state else {
-            return None;
-        };
-
-        let wgpu_device = wgpu_render_state.device.clone();
-        let wgpu_queue: std::sync::Arc<wgpu::Queue> =
-            std::sync::Arc::new(wgpu_render_state.queue.clone());
-
-        // Shader
-        let shader = wgpu_device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Compute Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("compute.wgsl").into()),
-        });
-
-        // MVP Buffer
-        let identity_matrix = glam::Mat4::IDENTITY;
-
-        let mvp_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MVP Uniform Buffer"),
-            contents: bytemuck::cast_slice(&identity_matrix.to_cols_array()),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // Bind group layout
-        let bind_group_layout =
-            wgpu_device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Compute Bind Group Layout"),
-                entries: &[
-                    // MVP Uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    // Input Storage
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    // Output Storage
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        let (input_buffer, output_buffer, staging_buffer, buffer_size, compute_bind_group) =
-            Self::gpu_setup_model(&wgpu_device, &bind_group_layout, &mvp_buffer, &model);
-
-        // Compute Pipeline
-        let pipeline_layout = wgpu_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Compute Pipeline Layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let compute_pipeline =
-            wgpu_device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("Compute Pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        return Some(GPUData {
-            wgpu_device,
-            wgpu_queue,
-            // Buffers
-            mvp_buffer,
-            input_buffer,
-            output_buffer,
-            staging_buffer,
-            buffer_size,
-            is_mapping: false,
-            mapping_receiver: None,
-            // Pipeline
-            compute_pipeline,
-            bind_group_layout,
-            compute_bind_group,
-        });
-    }
-
-    fn gpu_setup_model(
-        wgpu_device: &wgpu::Device,
-        bind_group_layout: &wgpu::BindGroupLayout,
-        mvp_buffer: &wgpu::Buffer,
-        model: &ModelData,
-    ) -> (
-        wgpu::Buffer,
-        wgpu::Buffer,
-        wgpu::Buffer,
-        u64,
-        wgpu::BindGroup,
-    ) {
-        // Input Buffer
-        let input_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&model.vertices),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let buffer_size =
-            (model.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
-
-        // Output buffer
-        let output_buffer = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Output Vertex Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // Staging buffer
-        let staging_buffer = wgpu_device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Bind group
-        let compute_bind_group = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: mvp_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: input_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: output_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        return (
-            input_buffer,
-            output_buffer,
-            staging_buffer,
-            buffer_size,
-            compute_bind_group,
-        );
-    }
-
-    fn gpu_compute(
-        gpu_data: &mut GPUData,
-        mvp: glam::Mat4,
-        vertex_count: u32,
-    ) -> Option<wgpu::BufferView> {
-        // Called Every frame
-
-        // Send MVP to GPU
-        gpu_data.wgpu_queue.write_buffer(
-            &gpu_data.mvp_buffer,
-            0,
-            bytemuck::cast_slice(&mvp.to_cols_array()),
-        );
-
-        if !gpu_data.is_mapping {
-            let mut encoder = gpu_data
-                .wgpu_device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-            {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: None,
-                    timestamp_writes: None,
-                });
-                compute_pass.set_pipeline(&gpu_data.compute_pipeline);
-                compute_pass.set_bind_group(0, &gpu_data.compute_bind_group, &[]);
-
-                // let vertex_count = self.model_data.vertices.len() as u32;
-                let workgroup_count = (vertex_count + 63) / 64;
-                compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
-            }
-
-            // output_buffer -> staging_buffer
-            encoder.copy_buffer_to_buffer(
-                &gpu_data.output_buffer,
-                0,
-                &gpu_data.staging_buffer,
-                0,
-                gpu_data.buffer_size,
-            );
-
-            gpu_data.wgpu_queue.submit(Some(encoder.finish()));
-
-            gpu_data.is_mapping = true;
-
-            let buffer_slice = gpu_data.staging_buffer.slice(..);
-            let (sender, receiver) = std::sync::mpsc::channel();
-
-            buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-                // sender.send(result).unwrap();
-                let _ = sender.send(result);
-            });
-
-            gpu_data.mapping_receiver = Some(receiver);
-        }
-
-        if let Some(receiver) = &gpu_data.mapping_receiver {
-            if let Ok(Ok(())) = receiver.try_recv() {
-                let buffer_slice = gpu_data.staging_buffer.slice(..);
-                let data = buffer_slice.get_mapped_range();
-
-                gpu_data.mapping_receiver = None;
-                gpu_data.is_mapping = false;
-
-                return Some(data);
-            }
-        }
-
-        return None;
-    }
 
     // Wireframe Rendering
     fn render_frame(&mut self, painter: &egui::Painter) {
@@ -606,8 +675,10 @@ impl OdekEngine {
         // 5) Projection : GPU Computing + CPU Fallback
 
         // GPU
-        if self.gpu_computing && let Some(mut gpu_data) = self.gpu_data.take() {
-            let data = Self::gpu_compute(&mut gpu_data, mvp, self.model_data.vertices.len() as u32);
+        if self.gpu_computing
+            && let Some(mut gpu_data) = self.gpu_data.take()
+        {
+            let data = gpu_data.gpu_compute(mvp, self.model_data.vertices.len() as u32);
 
             if let Some(data) = data {
                 // println!("GPU");
@@ -766,25 +837,11 @@ impl OdekEngine {
     fn set_model(&mut self, model: ModelData) {
         self.model_data = model;
 
-        if self.gpu_data.is_none() {
+        let Some(gpu_data) = self.gpu_data.as_mut() else {
             return;
-        }
+        };
 
-        let gpu_data = self.gpu_data.as_mut().unwrap();
-
-        let (input_buffer, output_buffer, staging_buffer, buffer_size, compute_bind_group) =
-            Self::gpu_setup_model(
-                &gpu_data.wgpu_device,
-                &gpu_data.bind_group_layout,
-                &gpu_data.mvp_buffer,
-                &self.model_data,
-            );
-
-        gpu_data.input_buffer = input_buffer;
-        gpu_data.output_buffer = output_buffer;
-        gpu_data.staging_buffer = staging_buffer;
-        gpu_data.buffer_size = buffer_size;
-        gpu_data.compute_bind_group = compute_bind_group;
+        gpu_data.set_model(&self.model_data);
     }
 
     fn hud(&mut self, painter: &egui::Painter, fps: f32) {
