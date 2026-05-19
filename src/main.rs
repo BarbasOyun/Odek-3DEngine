@@ -304,15 +304,11 @@ impl OdekEngine {
 
     // GPU Computing
     fn gpu_setup(cc: &CreationContext, model: &ModelData) -> Option<GPUData> {
-        // let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("wgpu not enabled!");
         let state: Option<&eframe::egui_wgpu::RenderState> = cc.wgpu_render_state.as_ref();
 
-        if state.is_none() {
+        let Some(wgpu_render_state) = state else {
             return None;
-            // panic!("wgpu not enabled! Make sure to enable the 'wgpu' feature in Cargo.toml");
-        }
-
-        let wgpu_render_state = state.unwrap();
+        };
 
         let wgpu_device = wgpu_render_state.device.clone();
         let wgpu_queue: std::sync::Arc<wgpu::Queue> =
@@ -484,7 +480,8 @@ impl OdekEngine {
         gpu_data: &mut GPUData,
         mvp: glam::Mat4,
         vertex_count: u32,
-    ) -> Option<wgpu::BufferView> { // &[Vertex]
+    ) -> Option<wgpu::BufferView> {
+        // &[Vertex]
         // Called Every frame
 
         // Send MVP to GPU
@@ -494,36 +491,37 @@ impl OdekEngine {
             bytemuck::cast_slice(&mvp.to_cols_array()),
         );
 
-        let mut encoder = gpu_data
-            .wgpu_device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        if !gpu_data.is_mapping {
+            // && gpu_data.mapping_receiver.is_none()
+            let mut encoder = gpu_data
+                .wgpu_device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&gpu_data.compute_pipeline);
-            compute_pass.set_bind_group(0, &gpu_data.compute_bind_group, &[]);
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&gpu_data.compute_pipeline);
+                compute_pass.set_bind_group(0, &gpu_data.compute_bind_group, &[]);
 
-            // let vertex_count = self.model_data.vertices.len() as u32;
-            let workgroup_count = (vertex_count + 63) / 64;
-            compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
-        }
+                // let vertex_count = self.model_data.vertices.len() as u32;
+                let workgroup_count = (vertex_count + 63) / 64;
+                compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
+            }
 
-        // output_buffer -> staging_buffer
-        encoder.copy_buffer_to_buffer(
-            &gpu_data.output_buffer,
-            0,
-            &gpu_data.staging_buffer,
-            0,
-            gpu_data.buffer_size,
-        );
-
-        if !gpu_data.is_mapping && gpu_data.mapping_receiver.is_none() {
-            gpu_data.is_mapping = true;
+            // output_buffer -> staging_buffer
+            encoder.copy_buffer_to_buffer(
+                &gpu_data.output_buffer,
+                0,
+                &gpu_data.staging_buffer,
+                0,
+                gpu_data.buffer_size,
+            );
 
             gpu_data.wgpu_queue.submit(Some(encoder.finish()));
+
+            gpu_data.is_mapping = true;
 
             let buffer_slice = gpu_data.staging_buffer.slice(..);
             let (sender, receiver) = std::sync::mpsc::channel();
@@ -549,12 +547,6 @@ impl OdekEngine {
                 return Some(data);
             }
         }
-
-        // if let Ok(Ok(())) = receiver.try_recv() {
-        //     let data = buffer_slice.get_mapped_range();
-
-        //     return Some(data);
-        // }
 
         return None;
     }
@@ -621,6 +613,7 @@ impl OdekEngine {
             let data = Self::gpu_compute(&mut gpu_data, mvp, self.model_data.vertices.len() as u32);
 
             if let Some(data) = data {
+                // println!("GPU");
                 let output_vertices: &[Vertex] = bytemuck::cast_slice(&data);
 
                 let proj_vertices = output_vertices
@@ -633,13 +626,14 @@ impl OdekEngine {
                 drop(data);
                 gpu_data.staging_buffer.unmap();
 
+                self.gpu_data = Some(gpu_data);
                 return proj_vertices;
             }
 
             self.gpu_data = Some(gpu_data);
         }
 
-        // CPU
+        // println!("CPU");
         return self
             .model_data
             .vertices

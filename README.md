@@ -18,8 +18,14 @@
 -Move + Rotate Camera<br>
 -Import OBJ File<br>
 -Right-Handed 3D (Z forward = -Z, Camera start at 180° Y Rotation) Similar to : Blender, Godot, OpenGl, Vulkan<br>
--GPU computing : the vertices are multiplied by the MVP matrix using the GPU and handed back to egui's Render Pipeline<br>
-(it's a weird setup that allowed me to discover GPU Computing)<br>
+
+### GPU Computing
+
+-The vertices are multiplied by the MVP matrix using the GPU and handed back to egui's Render Pipeline<br>
+-CPU Fallback when GPU is not ready<br>
+-> it's a weird setup that allowed me to discover GPU Computing<br>
+-> It lead to 50% of the frames computed by GPU and the other 50% by the CPU (I have to get the computed data back asynchronously)<br>
+-Fix = Double Buffering<br>
 
 ## Learnings
 
