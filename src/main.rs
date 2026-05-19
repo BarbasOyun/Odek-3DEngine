@@ -59,7 +59,6 @@ fn main() {
     //     power_preference: wgpu::PowerPreference::from_env().unwrap_or_default(),
     //     native_adapter_selector: None,
 
-    //     // Pass your custom limits directly into the adapter-to-device factory
     //     device_descriptor: std::sync::Arc::new(move |_adapter| wgpu::DeviceDescriptor {
     //         label: Some("egui_wgpu_compute_device"),
     //         required_features: wgpu::Features::empty(),
@@ -185,6 +184,11 @@ struct GPUData {
 
 struct OdekEngine {
     // RENDERING
+    gpu_computing: bool,
+    three_d_viewport: egui::Rect,
+    stroke: Stroke,
+    display_vertices: bool,
+    // CAMERA
     // TODO : Store Radians instead of Degrees (Performance)
     smoothed_fps: f32,
     camera_position: Vec3,
@@ -193,10 +197,7 @@ struct OdekEngine {
     sensitivity: f32,
     camera_forward: Vec3,
     fov: f32, // Field of View (Degrees)
-    stroke: Stroke,
     perspective: bool,
-    display_vertices: bool,
-    three_d_viewport: egui::Rect,
     // LOGIC : Transformations
     bindings: Bindings,
     azerty: bool,
@@ -226,6 +227,11 @@ impl OdekEngine {
         let gpu_data = Self::gpu_setup(cc, &cube);
 
         Self {
+            // RENDERING
+            gpu_computing: false,
+            three_d_viewport: cc.egui_ctx.content_rect(),
+            stroke: egui::Stroke::new(2.0, egui::Color32::from_rgb(190, 110, 40)),
+            display_vertices: true,
             // CAMERA
             smoothed_fps: 60.0,
             camera_position: Vec3::new(0.0, 0.0, -1.0),
@@ -234,11 +240,7 @@ impl OdekEngine {
             sensitivity: 5.0,
             camera_forward: Vec3::new(0.0, 0.0, 1.0),
             fov: 90.0,
-            // RENDERING
-            stroke: egui::Stroke::new(2.0, egui::Color32::from_rgb(190, 110, 40)),
             perspective: true,
-            display_vertices: true,
-            three_d_viewport: cc.egui_ctx.content_rect(),
             // LOGIC : Inputs
             bindings: Bindings::qwerty(),
             azerty: false,
@@ -604,7 +606,7 @@ impl OdekEngine {
         // 5) Projection : GPU Computing + CPU Fallback
 
         // GPU
-        if let Some(mut gpu_data) = self.gpu_data.take() {
+        if self.gpu_computing && let Some(mut gpu_data) = self.gpu_data.take() {
             let data = Self::gpu_compute(&mut gpu_data, mvp, self.model_data.vertices.len() as u32);
 
             if let Some(data) = data {
@@ -1020,6 +1022,7 @@ impl eframe::App for OdekEngine {
                 }
 
                 // Rendering Settings
+                ui.checkbox(&mut self.gpu_computing, "GPU Computing");
                 ui.checkbox(&mut self.perspective, "Perspective");
                 ui.add(
                     egui::DragValue::new(&mut self.fov)
