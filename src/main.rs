@@ -476,12 +476,10 @@ impl OdekEngine {
     }
 
     fn gpu_compute(
-        // &self,
         gpu_data: &mut GPUData,
         mvp: glam::Mat4,
         vertex_count: u32,
     ) -> Option<wgpu::BufferView> {
-        // &[Vertex]
         // Called Every frame
 
         // Send MVP to GPU
@@ -492,7 +490,6 @@ impl OdekEngine {
         );
 
         if !gpu_data.is_mapping {
-            // && gpu_data.mapping_receiver.is_none()
             let mut encoder = gpu_data
                 .wgpu_device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -538,12 +535,10 @@ impl OdekEngine {
             if let Ok(Ok(())) = receiver.try_recv() {
                 let buffer_slice = gpu_data.staging_buffer.slice(..);
                 let data = buffer_slice.get_mapped_range();
-                // let output_vertices: &[Vertex] = bytemuck::cast_slice(&data);
 
                 gpu_data.mapping_receiver = None;
                 gpu_data.is_mapping = false;
 
-                // return Some(output_vertices);
                 return Some(data);
             }
         }
