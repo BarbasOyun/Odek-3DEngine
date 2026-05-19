@@ -32,13 +32,51 @@ async fn main() -> eframe::Result {
 fn main() {
     use eframe::wasm_bindgen::JsCast as _;
 
-    let mut three_d_engine = OdekEngine::new();
-    three_d_engine.cube();
+    // std::panic::set_hook(Box::new(console_error_panic_hook::hook));
 
-    // Redirect `log` message to `console.log` and friends:
+    // Redirect `log` message to `console.log`
     eframe::WebLogger::init(log::LevelFilter::Debug).ok();
 
+    // wgpu web settings
+    // DEFAULT OPTION
     let web_options = eframe::WebOptions::default();
+
+    // CUSTOM OPTION
+    // let required_limits = wgpu::Limits {
+    //     max_storage_buffers_per_shader_stage: 4,
+    //     ..wgpu::Limits::downlevel_webgl2_defaults()
+    // };
+
+    // let setup_config = eframe::egui_wgpu::WgpuSetupCreateNew {
+    //     instance_descriptor: wgpu::InstanceDescriptor {
+    //         backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all()), // wgpu::Backends::BROWSER_WEBGPU
+    //         flags: wgpu::InstanceFlags::from_build_config().with_env(),
+    //         memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+    //         backend_options: wgpu::BackendOptions::from_env_or_default(),
+    //         display: None,
+    //     },
+    //     display_handle: None,
+    //     power_preference: wgpu::PowerPreference::from_env().unwrap_or_default(),
+    //     native_adapter_selector: None,
+
+    //     // Pass your custom limits directly into the adapter-to-device factory
+    //     device_descriptor: std::sync::Arc::new(move |_adapter| wgpu::DeviceDescriptor {
+    //         label: Some("egui_wgpu_compute_device"),
+    //         required_features: wgpu::Features::empty(),
+    //         required_limits: required_limits.clone(),
+    //         experimental_features: wgpu::ExperimentalFeatures::disabled(),
+    //         memory_hints: wgpu::MemoryHints::default(),
+    //         trace: wgpu::Trace::Off,
+    //     }),
+    // };
+
+    // let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    // wgpu_options.wgpu_setup = eframe::egui_wgpu::WgpuSetup::CreateNew(setup_config);
+
+    // let web_options = eframe::WebOptions {
+    //     wgpu_options,
+    //     ..Default::default()
+    // };
 
     wasm_bindgen_futures::spawn_local(async {
         let document = web_sys::window()
@@ -56,11 +94,11 @@ fn main() {
             .start(
                 canvas,
                 web_options,
-                Box::new(|_cc| Ok(Box::new(three_d_engine))),
+                Box::new(|_cc| Ok(Box::new(OdekEngine::new(_cc)))),
             )
             .await;
 
-        // Remove the loading text and spinner:
+        // Remove the loading text and spinner
         if let Some(loading_text) = document.get_element_by_id("loading_text") {
             match start_result {
                 Ok(_) => {
@@ -137,6 +175,8 @@ struct GPUData {
     output_buffer: wgpu::Buffer,
     staging_buffer: wgpu::Buffer,
     buffer_size: wgpu::BufferAddress,
+    is_mapping: bool,
+    mapping_receiver: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
     // Pipeline
     compute_pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -173,7 +213,7 @@ struct OdekEngine {
     model_data: ModelData,
     tx: Sender<Vec<u8>>,
     rx: Receiver<Vec<u8>>,
-    gpu_data: GPUData,
+    gpu_data: Option<GPUData>,
 }
 
 impl OdekEngine {
@@ -263,8 +303,17 @@ impl OdekEngine {
     // RENDERING
 
     // GPU Computing
-    fn gpu_setup(cc: &CreationContext, model: &ModelData) -> GPUData {
-        let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("wgpu not enabled!");
+    fn gpu_setup(cc: &CreationContext, model: &ModelData) -> Option<GPUData> {
+        // let wgpu_render_state = cc.wgpu_render_state.as_ref().expect("wgpu not enabled!");
+        let state: Option<&eframe::egui_wgpu::RenderState> = cc.wgpu_render_state.as_ref();
+
+        if state.is_none() {
+            return None;
+            // panic!("wgpu not enabled! Make sure to enable the 'wgpu' feature in Cargo.toml");
+        }
+
+        let wgpu_render_state = state.unwrap();
+
         let wgpu_device = wgpu_render_state.device.clone();
         let wgpu_queue: std::sync::Arc<wgpu::Queue> =
             std::sync::Arc::new(wgpu_render_state.queue.clone());
@@ -326,12 +375,7 @@ impl OdekEngine {
             });
 
         let (input_buffer, output_buffer, staging_buffer, buffer_size, compute_bind_group) =
-            Self::gpu_setup_model(
-                &wgpu_device,
-                &bind_group_layout,
-                &mvp_buffer,
-                &model,
-            );
+            Self::gpu_setup_model(&wgpu_device, &bind_group_layout, &mvp_buffer, &model);
 
         // Compute Pipeline
         let pipeline_layout = wgpu_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -350,18 +394,22 @@ impl OdekEngine {
                 cache: None,
             });
 
-        return GPUData {
+        return Some(GPUData {
             wgpu_device,
             wgpu_queue,
+            // Buffers
             mvp_buffer,
             input_buffer,
             output_buffer,
             staging_buffer,
             buffer_size,
+            is_mapping: false,
+            mapping_receiver: None,
+            // Pipeline
             compute_pipeline,
             bind_group_layout,
             compute_bind_group,
-        };
+        });
     }
 
     fn gpu_setup_model(
@@ -369,7 +417,13 @@ impl OdekEngine {
         bind_group_layout: &wgpu::BindGroupLayout,
         mvp_buffer: &wgpu::Buffer,
         model: &ModelData,
-    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, u64, wgpu::BindGroup) {
+    ) -> (
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        u64,
+        wgpu::BindGroup,
+    ) {
         // Input Buffer
         let input_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
@@ -426,14 +480,12 @@ impl OdekEngine {
     }
 
     fn gpu_compute(
-        &self,
+        // &self,
+        gpu_data: &mut GPUData,
         mvp: glam::Mat4,
-    ) -> (
-        Receiver<Result<(), wgpu::BufferAsyncError>>,
-        wgpu::BufferSlice<'_>,
-    ) {
+        vertex_count: u32,
+    ) -> Option<wgpu::BufferView> { // &[Vertex]
         // Called Every frame
-        let gpu_data = &self.gpu_data;
 
         // Send MVP to GPU
         gpu_data.wgpu_queue.write_buffer(
@@ -454,7 +506,7 @@ impl OdekEngine {
             compute_pass.set_pipeline(&gpu_data.compute_pipeline);
             compute_pass.set_bind_group(0, &gpu_data.compute_bind_group, &[]);
 
-            let vertex_count = self.model_data.vertices.len() as u32;
+            // let vertex_count = self.model_data.vertices.len() as u32;
             let workgroup_count = (vertex_count + 63) / 64;
             compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
         }
@@ -468,25 +520,47 @@ impl OdekEngine {
             gpu_data.buffer_size,
         );
 
-        gpu_data.wgpu_queue.submit(Some(encoder.finish()));
+        if !gpu_data.is_mapping && gpu_data.mapping_receiver.is_none() {
+            gpu_data.is_mapping = true;
 
-        let buffer_slice = gpu_data.staging_buffer.slice(..);
+            gpu_data.wgpu_queue.submit(Some(encoder.finish()));
 
-        let (sender, receiver) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
-        });
+            let buffer_slice = gpu_data.staging_buffer.slice(..);
+            let (sender, receiver) = std::sync::mpsc::channel();
 
-        gpu_data
-            .wgpu_device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .unwrap();
+            buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+                // sender.send(result).unwrap();
+                let _ = sender.send(result);
+            });
 
-        return (receiver, buffer_slice);
+            gpu_data.mapping_receiver = Some(receiver);
+        }
+
+        if let Some(receiver) = &gpu_data.mapping_receiver {
+            if let Ok(Ok(())) = receiver.try_recv() {
+                let buffer_slice = gpu_data.staging_buffer.slice(..);
+                let data = buffer_slice.get_mapped_range();
+                // let output_vertices: &[Vertex] = bytemuck::cast_slice(&data);
+
+                gpu_data.mapping_receiver = None;
+                gpu_data.is_mapping = false;
+
+                // return Some(output_vertices);
+                return Some(data);
+            }
+        }
+
+        // if let Ok(Ok(())) = receiver.try_recv() {
+        //     let data = buffer_slice.get_mapped_range();
+
+        //     return Some(data);
+        // }
+
+        return None;
     }
 
     // Wireframe Rendering
-    fn render_frame(&self, painter: &egui::Painter) {
+    fn render_frame(&mut self, painter: &egui::Painter) {
         let screen_points: Vec<Option<egui::Vec2>> = self.frame_image();
 
         // Render Vertices
@@ -509,7 +583,7 @@ impl OdekEngine {
     }
 
     // Base Model -> Model Matrix (Model & Transformations) * View/Camera * Projection -> 2D Frustum (Projection) -> Screen Space
-    fn frame_image(&self) -> Vec<Option<egui::Vec2>> {
+    fn frame_image(&mut self) -> Vec<Option<egui::Vec2>> {
         // 1) Model Matrix = Model + Transformations
         let model = glam::Mat4::from_scale_rotation_translation(
             self.model_scale,
@@ -543,23 +617,26 @@ impl OdekEngine {
         // 5) Projection : GPU Computing + CPU Fallback
 
         // GPU
-        let (receiver, buffer_slice) = self.gpu_compute(mvp);
+        if let Some(mut gpu_data) = self.gpu_data.take() {
+            let data = Self::gpu_compute(&mut gpu_data, mvp, self.model_data.vertices.len() as u32);
 
-        if let Ok(Ok(())) = receiver.recv() {
-            let data = buffer_slice.get_mapped_range();
-            let output_vertices: &[Vertex] = bytemuck::cast_slice(&data);
+            if let Some(data) = data {
+                let output_vertices: &[Vertex] = bytemuck::cast_slice(&data);
 
-            let proj_vertices = output_vertices
-                .iter()
-                .map(|v| {
-                    return self.vertex_projection(&v);
-                })
-                .collect();
+                let proj_vertices = output_vertices
+                    .iter()
+                    .map(|v| {
+                        return self.vertex_projection(&v);
+                    })
+                    .collect();
 
-            drop(data);
-            self.gpu_data.staging_buffer.unmap();
+                drop(data);
+                gpu_data.staging_buffer.unmap();
 
-            return proj_vertices;
+                return proj_vertices;
+            }
+
+            self.gpu_data = Some(gpu_data);
         }
 
         // CPU
@@ -570,7 +647,8 @@ impl OdekEngine {
             .map(|v| {
                 // let world_vertex: Vec3 = mvp.project_point3(*v);
 
-                let w: Vec3 = mvp.project_point3(Vec3::new(v.position[0], v.position[1], v.position[2]));
+                let w: Vec3 =
+                    mvp.project_point3(Vec3::new(v.position[0], v.position[1], v.position[2]));
                 let world_vertex: Vertex = Vertex::new(w.x, w.y, w.z);
 
                 return self.vertex_projection(&world_vertex);
@@ -579,16 +657,19 @@ impl OdekEngine {
     }
 
     // World -> 2D Frustum
-    fn vertex_projection(&self, world_v: &Vertex) -> Option<Vec2> { // &Vec3
+    fn vertex_projection(&self, world_v: &Vertex) -> Option<Vec2> {
+        // &Vec3
         // let is_in_fov = world_v.x.abs() <= 1.0 && world_v.y.abs() <= 1.0 && world_v.z.abs() <= 1.0;
-        let is_in_fov = world_v.position[0].abs() <= 1.0 && world_v.position[1].abs() <= 1.0 && world_v.position[2].abs() <= 1.0;
+        let is_in_fov = world_v.position[0].abs() <= 1.0
+            && world_v.position[1].abs() <= 1.0
+            && world_v.position[2].abs() <= 1.0;
 
         let fulcrum_point: Vec2;
 
         if self.perspective {
-            fulcrum_point = self.perspective_project(&world_v);
+            fulcrum_point = Self::perspective_project(&world_v);
         } else {
-            fulcrum_point = self.orthographic_project(&world_v);
+            fulcrum_point = Self::orthographic_project(&world_v);
         }
 
         return (is_in_fov).then(|| {
@@ -600,12 +681,16 @@ impl OdekEngine {
         });
     }
 
-    fn perspective_project(&self, vertex: &Vertex) -> Vec2 { // &Vec3
+    fn perspective_project(vertex: &Vertex) -> Vec2 {
+        // &Vec3
         // return Vec2::new(vertex.x / vertex.z, vertex.y / vertex.z);
-        return Vec2::new(vertex.position[0] / vertex.position[2], vertex.position[1] / vertex.position[2]);
+        return Vec2::new(
+            vertex.position[0] / vertex.position[2],
+            vertex.position[1] / vertex.position[2],
+        );
     }
 
-    fn orthographic_project(&self, vertex: &Vertex) -> Vec2 {
+    fn orthographic_project(vertex: &Vertex) -> Vec2 {
         return Vec2::new(vertex.position[0], vertex.position[1]);
     }
 
@@ -690,7 +775,11 @@ impl OdekEngine {
     fn set_model(&mut self, model: ModelData) {
         self.model_data = model;
 
-        let gpu_data = &self.gpu_data;
+        if self.gpu_data.is_none() {
+            return;
+        }
+
+        let gpu_data = self.gpu_data.as_mut().unwrap();
 
         let (input_buffer, output_buffer, staging_buffer, buffer_size, compute_bind_group) =
             Self::gpu_setup_model(
@@ -700,11 +789,11 @@ impl OdekEngine {
                 &self.model_data,
             );
 
-        self.gpu_data.input_buffer = input_buffer;
-        self.gpu_data.output_buffer = output_buffer;
-        self.gpu_data.staging_buffer = staging_buffer;
-        self.gpu_data.buffer_size = buffer_size;
-        self.gpu_data.compute_bind_group = compute_bind_group;
+        gpu_data.input_buffer = input_buffer;
+        gpu_data.output_buffer = output_buffer;
+        gpu_data.staging_buffer = staging_buffer;
+        gpu_data.buffer_size = buffer_size;
+        gpu_data.compute_bind_group = compute_bind_group;
     }
 
     fn hud(&mut self, painter: &egui::Painter, fps: f32) {

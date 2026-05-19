@@ -2,7 +2,7 @@
 
 -[Web Version](https://barbasoyun.github.io/3DEngine/)<br>
 -Odek is a 3D Engine written in Rust and using egui for rendering<br>
--It as both a desktop and web version<br>
+-It as both a desktop/native and web version<br>
 -WIP<br>
 -Using [This Tsoding video](https://www.youtube.com/watch?v=qjWkNZ0SXfo&list=WL&index=9&t=17s) as reference<br>
 
@@ -18,7 +18,8 @@
 -Move + Rotate Camera<br>
 -Import OBJ File<br>
 -Right-Handed 3D (Z forward = -Z, Camera start at 180° Y Rotation) Similar to : Blender, Godot, OpenGl, Vulkan<br>
--GPU computing : the vertices are multiplied by the MVP matrix using the GPU<br>
+-GPU computing : the vertices are multiplied by the MVP matrix using the GPU and handed back to egui's Render Pipeline<br>
+(it's a weird setup that allowed me to discover GPU Computing)<br>
 
 ## Learnings
 
