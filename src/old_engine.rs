@@ -439,3 +439,107 @@ impl eframe::App for ThreeDEngine {
         });
     }
 }
+
+// FUTURE ENGINE : GPU Render pipeline
+
+    /*
+    fn future_engine() {
+
+        let shader_module = wgpu_device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("vertex_shader.wgsl").into()),
+        });
+
+        // Create Vertex Buffer
+        let vertex_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&cube.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        // Create MVP Buffer
+        let identity_matrix = glam::Mat4::IDENTITY;
+
+        let mvp_buffer = wgpu_device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("MVP Uniform Buffer"),
+            contents: bytemuck::cast_slice(&identity_matrix.to_cols_array()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let render_pipeline = Self::gpu_pipeline(&wgpu_device, &mvp_buffer, &shader_module);
+    }
+
+    fn gpu_pipeline(
+        wgpu_device: &wgpu::Device,
+        mvp_buffer: &wgpu::Buffer,
+        shader_module: &wgpu::ShaderModule,
+    ) {
+        // -> wgpu::RenderPipeline
+        // Bind Group -> MVP
+        let bind_group_layout =
+            wgpu_device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+                label: Some("mvp_bind_group_layout"),
+            });
+
+        let bind_group = wgpu_device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: mvp_buffer.as_entire_binding(),
+            }],
+            label: Some("mvp_bind_group"),
+        });
+
+        // Vertex buffer layout
+        let vertex_buffer_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0, // @location(0) in vertex_shader.wgsl
+                format: wgpu::VertexFormat::Float32x3,
+            }],
+        };
+
+        let pipeline_layout = wgpu_device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            // push_constant_ranges: &[],
+            immediate_size: 0,
+        });
+
+        let render_pipeline = wgpu_device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader_module,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[vertex_buffer_layout],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader_module,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Bgra8UnormSrgb, // Match the surface format
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            // ... primitive, depth_stencil, and multisample settings
+        });
+
+        return render_pipeline;
+    }
+    */
