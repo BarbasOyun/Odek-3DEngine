@@ -234,20 +234,22 @@ impl GPUData {
     }
 
     pub fn set_model(&mut self, model_data: &ModelData) {
-        let (buffer_size, ring_buffers) =
-            Self::setup_model_ring(
-                &self.device,
-                &self.bind_group_layout,
-                &self.mvp_buffer,
-                model_data,
-            );
+        let (buffer_size, ring_buffers) = Self::setup_model_ring(
+            &self.device,
+            &self.bind_group_layout,
+            &self.mvp_buffer,
+            model_data,
+        );
 
         self.buffer_size = buffer_size;
         self.ring_buffers = ring_buffers;
     }
 
     pub fn double_buffering(&mut self, mvp: glam::Mat4, vertex_count: u32) -> Option<Vec<Vertex>> {
-        // wgpu::BufferView
+        self.device.poll(wgpu::PollType::Poll).expect("GPU Error");
+
+        // if success == 
+
         // Send MVP to GPU
         self.queue.write_buffer(
             &self.mvp_buffer,
@@ -255,7 +257,33 @@ impl GPUData {
             bytemuck::cast_slice(&mvp.to_cols_array()),
         );
 
-        // 1) Launch current Ring
+        let mut output_vertices = None;
+
+        // 1] Clear all Ready Buffers
+        for ring in &mut self.ring_buffers {
+            if ring.is_mapping {
+                let Some(ref receiver) = ring.receiver else {
+                    continue;
+                };
+
+                let Ok(Ok(())) = receiver.try_recv() else {
+                    continue;
+                };
+
+                let data = ring.staging_buffer.slice(..).get_mapped_range();
+                let vertices: &[Vertex] = bytemuck::cast_slice(&data);
+                let out_vertices = vertices.to_vec();
+
+                drop(data);
+                ring.staging_buffer.unmap(); // Return ownership to GPU
+                ring.is_mapping = false;
+                ring.receiver = None;
+
+                output_vertices = Some(out_vertices);
+            }
+        }
+
+        // 2] Launch current Ring
         let current_ring_index = self.current_ring_index;
         let current_ring = &mut self.ring_buffers[current_ring_index];
 
@@ -298,33 +326,10 @@ impl GPUData {
             current_ring.receiver = Some(receiver);
         }
 
-        // 2) Get Other Ring's Data/Result
-        let index = (current_ring_index + 1) % 2;
-        let other_ring = &mut self.ring_buffers[index];
+        // 3] Setup next frame
+        let next_index = (current_ring_index + 1) % 2;
+        self.current_ring_index = next_index;
 
-        if other_ring.is_mapping {
-            let Some(ref receiver) = other_ring.receiver else {
-                return None;
-            };
-
-            if let Ok(Ok(())) = receiver.try_recv() {
-                let data = other_ring.staging_buffer.slice(..).get_mapped_range();
-                // return Some(data);
-
-                let vertices: &[Vertex] = bytemuck::cast_slice(&data);
-                let output_vertices = vertices.to_vec();
-
-                drop(data);
-                other_ring.staging_buffer.unmap(); // Return ownership to GPU
-                other_ring.is_mapping = false;
-                other_ring.receiver = None;
-
-                self.current_ring_index = index;
-                return Some(output_vertices);
-            }
-        }
-
-        self.current_ring_index = index;
-        return None;
+        return output_vertices;
     }
 }
