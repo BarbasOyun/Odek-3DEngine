@@ -3,7 +3,6 @@ mod odek_gpu;
 // mod old_engine;
 
 use crate::odek_gpu::GPUData;
-
 use std::vec;
 
 use eframe::{CreationContext, egui::*};
@@ -352,14 +351,10 @@ impl OdekEngine {
         if self.gpu_computing
             && let Some(mut gpu_data) = self.gpu_data.take()
         {
-            // let data = gpu_data.gpu_compute(mvp, self.model_data.vertices.len() as u32);
-            // let data = gpu_data.double_buffering(mvp, self.model_data.vertices.len() as u32);
             let output_vertices =
                 gpu_data.double_buffering(mvp, self.model_data.vertices.len() as u32);
 
             if let Some(output_vertices) = output_vertices {
-                println!("GPU");
-
                 let proj_vertices = output_vertices
                     .iter()
                     .map(|v| {
@@ -371,28 +366,10 @@ impl OdekEngine {
                 return proj_vertices;
             }
 
-            // if let Some(data) = data {
-            //     println!("GPU");
-            //     let output_vertices: &[Vertex] = bytemuck::cast_slice(&data);
-
-            //     let proj_vertices = output_vertices
-            //         .iter()
-            //         .map(|v| {
-            //             return self.vertex_projection(&v);
-            //         })
-            //         .collect();
-
-            //     drop(data);
-            //     gpu_data.staging_buffer.unmap();
-
-            //     self.gpu_data = Some(gpu_data);
-            //     return proj_vertices;
-            // }
-
             self.gpu_data = Some(gpu_data);
         }
 
-        println!("CPU");
+        // println!("CPU");
         return self
             .model_data
             .vertices
@@ -559,6 +536,17 @@ impl OdekEngine {
         );
     }
 
+    fn reset(&mut self) {
+        self.camera_position = Vec3::new(0.0, 0.0, -1.0);
+        self.camera_rotation = Vec3::new(0.0, 180.0, 0.0);
+
+        self.model_position = Vec3::new(0.0, 0.0, 0.0);
+        self.model_rotation = Vec3::new(0.0, 0.0, 0.0);
+        self.model_scale = Vec3::new(1.0, 1.0, 1.0);
+
+        self.set_model(Self::cube());
+    }
+
     // Load OBJ
     fn pick_obj_async(&mut self) {
         // Define Operations
@@ -658,14 +646,7 @@ impl eframe::App for OdekEngine {
 
                 // Reset Scene
                 if ui.button("Reset Scene").clicked() {
-                    self.camera_position = Vec3::new(0.0, 0.0, -1.0);
-                    self.camera_rotation = Vec3::new(0.0, 180.0, 0.0);
-
-                    self.model_position = Vec3::new(0.0, 0.0, 0.0);
-                    self.model_rotation = Vec3::new(0.0, 0.0, 0.0);
-                    self.model_scale = Vec3::new(1.0, 1.0, 1.0);
-
-                    self.set_model(Self::cube());
+                    self.reset()
                 }
 
                 // Rendering Settings
