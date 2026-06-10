@@ -459,19 +459,6 @@ impl OdekEngine {
     // UTILS
 
     fn cube() -> ModelData {
-        // let vertices = vec![
-        //     // Front Face
-        //     Vec3::new(0.25, 0.25, 0.25),
-        //     Vec3::new(-0.25, 0.25, 0.25),
-        //     Vec3::new(-0.25, -0.25, 0.25),
-        //     Vec3::new(0.25, -0.25, 0.25),
-        //     // Back Face
-        //     Vec3::new(0.25, 0.25, -0.25),
-        //     Vec3::new(-0.25, 0.25, -0.25),
-        //     Vec3::new(-0.25, -0.25, -0.25),
-        //     Vec3::new(0.25, -0.25, -0.25),
-        // ];
-
         let vertices = vec![
             // Front Face
             Vertex::new(0.25, 0.25, 0.25),
