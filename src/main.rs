@@ -3,10 +3,10 @@ mod odek_gpu;
 // mod old_engine;
 
 use crate::odek_gpu::GPUData;
-use std::vec;
-
 use eframe::{CreationContext, egui::*};
 use glam::Vec3;
+use std::fmt;
+use std::vec;
 
 // Import File
 use rfd::AsyncFileDialog;
@@ -23,7 +23,7 @@ async fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "Odek 3D Engine",
+        "Odek 3D Engine 0.2",
         options,
         Box::new(|_cc| Ok(Box::new(OdekEngine::new(_cc)))),
     )
@@ -165,6 +165,30 @@ struct ModelData {
     faces: Vec<Vec<u16>>,
 }
 
+impl fmt::Display for ModelData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
+        write!(
+            f,
+            "ModelData (Vertices: {}, Faces: {})\n",
+            self.vertices.len(),
+            self.faces.len()
+        )?;
+
+        // write vertices
+        // write!(f, "  Vertices:\n")?;
+        // for (i, vertex) in self.vertices.iter().enumerate() {
+        //     write!(f, "    [{}]: {:?}\n", i, vertex)?;
+        // }
+
+        write!(f, "  Faces:\n")?;
+        for (i, face) in self.faces.iter().enumerate() {
+            write!(f, "    [{}]: {:?}\n", i, face)?;
+        }
+
+        Ok(())
+    }
+}
+
 // OdekGPU
 
 struct OdekEngine {
@@ -187,6 +211,7 @@ struct OdekEngine {
     bindings: Bindings,
     azerty: bool,
     // TODO : Objects List -> Manage Multiple Objects + Draw Origin
+    // -> Use face_vertex_index + offset = vertex count of every previous models
     model_position: Vec3,
     model_rotation: Vec3, // Degrees
     model_scale: Vec3,
@@ -204,10 +229,14 @@ struct OdekEngine {
 
 impl OdekEngine {
     fn new(cc: &CreationContext) -> Self {
-        let cube = Self::cube();
-
         // Communication Channel for Async File Loading
         let (tx, rx) = channel::<Vec<u8>>();
+
+        let cube = Self::cube();
+
+        // Triangulated cube
+        // let mut cube = Self::cube();
+        // Self::triangulate_faces(&mut cube);
 
         let gpu_data = GPUData::new(cc, &cube);
 
@@ -296,24 +325,38 @@ impl OdekEngine {
         // Render Vertices
         if self.display_vertices {
             for point in &screen_points {
-                self.render_vertex(&painter, *point);
+                if let Some(p) = point
+                    && self.is_in_screen(*p)
+                {
+                    self.render_vertex(&painter, *p);
+                }
             }
         }
 
         // Render Edges
         for face in &self.model_data.faces {
             for i in 0..face.len() {
-                self.render_edge(
-                    &painter,
-                    screen_points[face[i] as usize],
-                    screen_points[face[(i + 1) % face.len()] as usize],
-                );
+                let point1 = screen_points[face[i] as usize];
+                let point2 = screen_points[face[(i + 1) % face.len()] as usize];
+
+                // if vertices are on screen
+                if let (Some(p1), Some(p2)) = (point1, point2) {
+                    // TODO : 3D Clipping
+                    // let is_p1_in_screen = self.is_in_screen(p1);
+                    // let is_p2_in_screen = self.is_in_screen(p2);
+
+                    // if is_p1_in_screen || is_p2_in_screen {
+                    //     self.render_edge(&painter, p1, p2);
+                    // }
+
+                    self.render_edge(&painter, p1, p2);
+                }
             }
         }
     }
 
     // Base Model -> Model Matrix (Model & Transformations) * View/Camera * Projection -> 2D Frustum (Projection) -> Screen Space
-    // return proj_vertices
+    // return points on screen
     fn frame_image(&mut self) -> Vec<Option<egui::Vec2>> {
         // 1) Model Matrix = Model + Transformations
         let model = glam::Mat4::from_scale_rotation_translation(
@@ -335,12 +378,36 @@ impl OdekEngine {
         ); // Vec3::Y = (0, 1, 0)
 
         // 3) Projection Matrix
-        let projection = glam::Mat4::perspective_rh(
-            self.fov.to_radians(),
-            1.0,
-            0.1,    // Near clip
-            1000.0, // Far clip
-        );
+        let projection;
+
+        if self.perspective {
+            let fov_y_radians = 2.0
+                * f32::atan(
+                    f32::tan(self.fov.to_radians() / 2.0) / self.three_d_viewport.aspect_ratio(),
+                );
+
+            projection = glam::Mat4::perspective_rh(
+                fov_y_radians, // self.fov.to_radians(),
+                self.three_d_viewport.aspect_ratio(),
+                0.1,    // Near clip
+                1000.0, // Far clip
+            );
+        } else {
+            let half_width = self.three_d_viewport.width() * 0.001;
+            let half_height = self.three_d_viewport.height() * 0.001;
+
+            projection = glam::Mat4::orthographic_rh(
+                -half_width,
+                half_width,
+                -half_height,
+                half_height,
+                0.1,
+                1000.0,
+            );
+        }
+
+        // TODO : Calc vp once / frame -> per model m * vp
+        // let vp = view * model;
 
         // 4) Apply Matrices : Model -> View -> Projection
         let mvp: glam::Mat4 = projection * view * model;
@@ -351,112 +418,113 @@ impl OdekEngine {
         if self.gpu_computing
             && let Some(mut gpu_data) = self.gpu_data.take()
         {
-            let output_vertices =
+            // let output_vertices =
+            //     gpu_data.double_buffering(mvp, self.model_data.vertices.len() as u32);
+
+            // if let Some(output_vertices) = output_vertices {
+            //     let proj_vertices = output_vertices
+            //         .iter()
+            //         .map(|vertex| {
+            //             return self.vertex_projection(&vertex);
+            //         })
+            //         .collect();
+
+            //     self.gpu_data = Some(gpu_data);
+            //     return proj_vertices;
+            // }
+
+            let clip_space_vertices =
                 gpu_data.double_buffering(mvp, self.model_data.vertices.len() as u32);
 
-            if let Some(output_vertices) = output_vertices {
-                let proj_vertices = output_vertices
+            if let Some(clip_space_vertices) = clip_space_vertices {
+                let screen_points = clip_space_vertices
                     .iter()
-                    .map(|v| {
-                        return self.vertex_projection(&v);
+                    .map(|clip_space_v| {
+                        // vertex
+                        // return self.vertex_projection(&vertex);
+                        return self.clip_to_screen(clip_space_v);
                     })
                     .collect();
 
                 self.gpu_data = Some(gpu_data);
-                return proj_vertices;
+                return screen_points;
             }
 
             self.gpu_data = Some(gpu_data);
         }
 
-        // println!("CPU");
-        return self
+        let screen_points = self
             .model_data
             .vertices
             .iter()
-            .map(|v| {
-                // let world_vertex: Vec3 = mvp.project_point3(*v);
+            .map(|vertex| {
+                let vertex_vec4 = glam::vec4(
+                    vertex.position[0],
+                    vertex.position[1],
+                    vertex.position[2],
+                    1.0,
+                );
 
-                let w: Vec3 =
-                    mvp.project_point3(Vec3::new(v.position[0], v.position[1], v.position[2]));
-                let world_vertex: Vertex = Vertex::new(w.x, w.y, w.z);
+                let clip_space_v = mvp * vertex_vec4;
 
-                return self.vertex_projection(&world_vertex);
+                return self.clip_to_screen(&clip_space_v);
             })
             .collect();
+
+        // println!("CPU");
+        return screen_points;
     }
 
-    // World -> 2D Frustum
-    fn vertex_projection(&self, world_v: &Vertex) -> Option<Vec2> {
-        // &Vec3
-        // let is_in_fov = world_v.x.abs() <= 1.0 && world_v.y.abs() <= 1.0 && world_v.z.abs() <= 1.0;
-        let is_in_fov = world_v.position[0].abs() <= 1.0
-            && world_v.position[1].abs() <= 1.0
-            && world_v.position[2].abs() <= 1.0;
+    // clip_space_vertex -> screen point
+    fn clip_to_screen(&self, clip_space_v: &glam::Vec4) -> Option<Vec2> {
+        let is_in_fov = clip_space_v.x.abs() <= clip_space_v.w
+            && clip_space_v.y.abs() <= clip_space_v.w
+            && clip_space_v.z >= 0.0
+            && clip_space_v.z <= clip_space_v.w;
 
-        let fulcrum_point: Vec2;
+        // TODO : Out of FOV edge rendering
+        if is_in_fov {
+            // fulcrum
+            let ndc_x = clip_space_v.x / clip_space_v.w;
+            let ndc_y = clip_space_v.y / clip_space_v.w;
+            // let ndc_z = clip_space_v.z / clip_space_v.w;
 
-        if self.perspective {
-            fulcrum_point = Self::perspective_project(&world_v);
-        } else {
-            fulcrum_point = Self::orthographic_project(&world_v);
+            // screen
+            let screen_x = (ndc_x + 1.0) * 0.5 * self.three_d_viewport.width();
+            let screen_y = (1.0 - ndc_y) * 0.5 * self.three_d_viewport.height(); // Inverted Y for UI
+
+            return Some(Vec2::new(screen_x, screen_y));
         }
 
-        return (is_in_fov).then(|| {
-            Self::proj_to_screen(
-                &fulcrum_point,
-                self.three_d_viewport.width(),
-                self.three_d_viewport.height(),
-            )
-        });
+        return None;
     }
 
-    fn perspective_project(vertex: &Vertex) -> Vec2 {
-        // &Vec3
-        // return Vec2::new(vertex.x / vertex.z, vertex.y / vertex.z);
-        return Vec2::new(
-            vertex.position[0] / vertex.position[2],
-            vertex.position[1] / vertex.position[2],
+    fn render_vertex(&self, painter: &egui::Painter, point: Vec2) {
+        let vertex_rect =
+            Rect::from_center_size(self.three_d_viewport.left_top() + point, vec2(10.0, 10.0));
+
+        painter.rect_filled(vertex_rect, 0.0, self.stroke.color);
+    }
+
+    fn render_edge(&self, painter: &egui::Painter, p1: Vec2, p2: Vec2) {
+        painter.line_segment(
+            [
+                self.three_d_viewport.left_top() + p1,
+                self.three_d_viewport.left_top() + p2,
+            ],
+            self.stroke,
         );
     }
 
-    fn orthographic_project(vertex: &Vertex) -> Vec2 {
-        return Vec2::new(vertex.position[0], vertex.position[1]);
-    }
-
-    // 2D Frustum -> Screen space
-    fn proj_to_screen(point: &Vec2, width: f32, height: f32) -> Vec2 {
-        // Aspect Ratio Correction -> Resize Window
-        let min = width.min(height);
-        let x_offset = (width.max(height) - min) * 0.5;
-
-        // -1..1 -> 0..2 -> 0..1 -> 0..width/height
-        let x = (point.x + 1.0) / 2.0 * min + x_offset;
-        let y = (1.0 - (point.y + 1.0) / 2.0) * min;
-        return Vec2::new(x, y);
-    }
-
-    fn render_vertex(&self, painter: &egui::Painter, vertex_pos: Option<Vec2>) {
-        if let Some(point) = vertex_pos {
-            let vertex_rect =
-                Rect::from_center_size(self.three_d_viewport.left_top() + point, vec2(10.0, 10.0));
-            painter.rect_filled(vertex_rect, 0.0, self.stroke.color);
-        }
-    }
-
-    fn render_edge(&self, painter: &egui::Painter, p1: Option<Vec2>, p2: Option<Vec2>) {
-        if let (Some(p1), Some(p2)) = (p1, p2) {
-            painter.line_segment(
-                [
-                    self.three_d_viewport.left_top() + p1,
-                    self.three_d_viewport.left_top() + p2,
-                ],
-                self.stroke,
-            );
-        }
-    }
-
     // UTILS
+
+    fn is_in_screen(&self, screen_point: Vec2) -> bool {
+        let is_in_width = 0.0 <= screen_point.x && screen_point.x <= self.three_d_viewport.width();
+        let is_in_height =
+            0.0 <= screen_point.y && screen_point.y <= self.three_d_viewport.height();
+
+        return is_in_width && is_in_height;
+    }
 
     fn cube() -> ModelData {
         let vertices = vec![
@@ -475,18 +543,34 @@ impl OdekEngine {
         let faces: Vec<Vec<u16>> = vec![
             vec![0, 1, 2, 3], // Front
             vec![4, 5, 6, 7], // Back
-            vec![0, 4],
-            vec![1, 5],
-            vec![2, 6],
-            vec![3, 7],
-            // Full Faces
-            // vec![0, 4, 7, 3], // Right
-            // vec![1, 5, 6, 2], // Left
-            // vec![0, 1, 5, 4], // Top
-            // vec![3, 2, 6, 7], // Bottom
+            vec![1, 5, 6, 2], // Right
+            vec![0, 4, 7, 3], // Left
+            vec![0, 1, 5, 4], // Top
+            vec![3, 2, 6, 7], // Bottom
         ];
 
         return ModelData { vertices, faces };
+    }
+
+    // triangulate Quads and Pentagon
+    fn triangulate_faces(model: &mut ModelData) {
+        let mut faces: Vec<Vec<u16>> = vec![];
+
+        // TODO : Edges Deduplication
+
+        for face in &model.faces {
+            let mut index = 1;
+
+            while index + 1 < face.len() {
+                let triangle_face = vec![face[0], face[index], face[index + 1]];
+                faces.push(triangle_face);
+                index += 1;
+            }
+        }
+
+        model.faces = faces;
+
+        // println!("{model}")
     }
 
     fn set_model(&mut self, model: ModelData) {

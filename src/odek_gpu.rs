@@ -245,10 +245,8 @@ impl GPUData {
         self.ring_buffers = ring_buffers;
     }
 
-    pub fn double_buffering(&mut self, mvp: glam::Mat4, vertex_count: u32) -> Option<Vec<Vertex>> {
+    pub fn double_buffering(&mut self, mvp: glam::Mat4, vertex_count: u32) -> Option<Vec<glam::Vec4>> { // Option<Vec<Vertex>>
         self.device.poll(wgpu::PollType::Poll).expect("GPU Error");
-
-        // if success == 
 
         // Send MVP to GPU
         self.queue.write_buffer(
@@ -271,7 +269,8 @@ impl GPUData {
                 };
 
                 let data = ring.staging_buffer.slice(..).get_mapped_range();
-                let vertices: &[Vertex] = bytemuck::cast_slice(&data);
+                // let vertices: &[Vertex] = bytemuck::cast_slice(&data);
+                let vertices: &[glam::Vec4] = bytemuck::cast_slice(&data);
                 let out_vertices = vertices.to_vec();
 
                 drop(data);
