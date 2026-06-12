@@ -419,21 +419,6 @@ impl OdekEngine {
         if self.gpu_computing
             && let Some(mut gpu_data) = self.gpu_data.take()
         {
-            // let output_vertices =
-            //     gpu_data.double_buffering(mvp, self.model_data.vertices.len() as u32);
-
-            // if let Some(output_vertices) = output_vertices {
-            //     let proj_vertices = output_vertices
-            //         .iter()
-            //         .map(|vertex| {
-            //             return self.vertex_projection(&vertex);
-            //         })
-            //         .collect();
-
-            //     self.gpu_data = Some(gpu_data);
-            //     return proj_vertices;
-            // }
-
             let clip_space_vertices =
                 gpu_data.compute_vertices(mvp, self.model_data.vertices.len() as u32);
 
@@ -441,8 +426,6 @@ impl OdekEngine {
                 let screen_points = clip_space_vertices
                     .iter()
                     .map(|clip_space_v| {
-                        // vertex
-                        // return self.vertex_projection(&vertex);
                         return self.clip_to_screen(clip_space_v);
                     })
                     .collect();

@@ -1,5 +1,4 @@
 use crate::ModelData;
-use crate::Vertex;
 
 use eframe::CreationContext;
 use std::sync::mpsc::Receiver;
@@ -13,6 +12,7 @@ pub struct RingBuffer {
     receiver: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 
+// Struct for Binding 0 -> MVP + vertex count
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct ComputeUniforms {
@@ -54,7 +54,6 @@ impl GPUData {
         // SHADER
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Compute Shader"),
-            // source: wgpu::ShaderSource::Wgsl(include_str!("compute.wgsl").into()),
             source: wgpu::ShaderSource::Wgsl(include_str!("vertex_shader.wgsl").into()),
         });
 
@@ -126,7 +125,6 @@ impl GPUData {
 
         let mvp_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MVP Uniform Buffer"),
-            // contents: bytemuck::cast_slice(&identity_matrix.to_cols_array()),
             contents: bytemuck::bytes_of(&uniform),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -162,10 +160,6 @@ impl GPUData {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Send vertices to buffer
-
-        // let buffer_size =
-        //     (model.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
         let buffer_size =
             (model.vertices.len() * std::mem::size_of::<glam::Vec4>()) as wgpu::BufferAddress;
 
@@ -277,7 +271,6 @@ impl GPUData {
         mvp: glam::Mat4,
         vertex_count: u32,
     ) -> Option<Vec<glam::Vec4>> {
-        // Option<Vec<Vertex>>
         // self.device.poll(wgpu::PollType::Poll).expect("GPU Error");
 
         // Send MVP to GPU
@@ -290,7 +283,6 @@ impl GPUData {
         self.queue.write_buffer(
             &self.mvp_buffer,
             0,
-            // bytemuck::cast_slice(&mvp.to_cols_array()),
             bytemuck::bytes_of(&uniform_payload),
         );
 
@@ -311,10 +303,7 @@ impl GPUData {
             };
 
             let data = ring.staging_buffer.slice(..).get_mapped_range();
-            // let vertices: &[Vertex] = bytemuck::cast_slice(&data);
-            let clip_space_vertices: &[glam::Vec4] = bytemuck::cast_slice(&data);
-            // let t = clip_space_vertices[0];
-            // println!("{t}");
+            let clip_space_vertices: Vec<glam::Vec4> = bytemuck::pod_collect_to_vec(&data);
             let out_vertices = clip_space_vertices.to_vec();
 
             drop(data);
