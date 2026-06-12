@@ -13,13 +13,26 @@ pub struct RingBuffer {
     receiver: Option<Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ComputeUniforms {
+    // mat4x4 = 16-element f32 array = 64 bytes
+    mvp: [f32; 16],
+    // 32 / 8 = 4 bytes
+    vertex_count: u32,
+    // Add padding to be multiple of 16 :
+    // 64 + 4 = 68 -> 68 / 16 = 4.25 -> 5 * 16 = 80 -> need to be 80 bytes of size
+    // -> 80 - 68 = 12 = 4 * 3
+    _padding: [u32; 3],
+}
+
 pub struct GPUData {
     device: wgpu::Device,
     queue: std::sync::Arc<wgpu::Queue>,
     // Buffers
     mvp_buffer: wgpu::Buffer,
     buffer_size: wgpu::BufferAddress,
-    ring_buffers: [RingBuffer; 2], // Ring Buffers = Double Buffering
+    ring_buffers: [RingBuffer; 2], // Double Buffering
     current_ring_index: usize,
     // Pipeline
     compute_pipeline: wgpu::ComputePipeline,
@@ -41,7 +54,8 @@ impl GPUData {
         // SHADER
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Compute Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("compute.wgsl").into()),
+            // source: wgpu::ShaderSource::Wgsl(include_str!("compute.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(include_str!("vertex_shader.wgsl").into()),
         });
 
         // PIPELINE
@@ -104,9 +118,16 @@ impl GPUData {
         // MVP Buffer
         let identity_matrix = glam::Mat4::IDENTITY;
 
+        let uniform: ComputeUniforms = ComputeUniforms {
+            mvp: identity_matrix.to_cols_array(),
+            vertex_count: model.vertices.len() as u32,
+            _padding: [0; 3],
+        };
+
         let mvp_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("MVP Uniform Buffer"),
-            contents: bytemuck::cast_slice(&identity_matrix.to_cols_array()),
+            // contents: bytemuck::cast_slice(&identity_matrix.to_cols_array()),
+            contents: bytemuck::bytes_of(&uniform),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -134,33 +155,23 @@ impl GPUData {
         mvp_buffer: &wgpu::Buffer,
         model: &ModelData,
     ) -> (u64, [RingBuffer; 2]) {
+        // Input Buffer -> Binding 1
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::cast_slice(&model.vertices),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Send vertices to buffer
+
+        // let buffer_size =
+        //     (model.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
         let buffer_size =
-            (model.vertices.len() * std::mem::size_of::<Vertex>()) as wgpu::BufferAddress;
+            (model.vertices.len() * std::mem::size_of::<glam::Vec4>()) as wgpu::BufferAddress;
 
-        // Staging Buffers : Copy output buffer -> Staging
-        let staging_buffer1 = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let staging_buffer2 = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Buffer2"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Output buffers
+        // Output buffers -> Binding 2
         let output_buffer1 = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Output Vertex Buffer"),
+            label: Some("Output Vertex Buffer1"),
             size: buffer_size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
@@ -173,9 +184,24 @@ impl GPUData {
             mapped_at_creation: false,
         });
 
+        // Staging Buffers : Copy output buffer -> Staging
+        let staging_buffer1 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer1"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let staging_buffer2 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer2"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Bind Groups
         let bind_group1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Compute Bind Group"),
+            label: Some("Compute Bind Group1"),
             layout: &bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -245,41 +271,58 @@ impl GPUData {
         self.ring_buffers = ring_buffers;
     }
 
-    pub fn double_buffering(&mut self, mvp: glam::Mat4, vertex_count: u32) -> Option<Vec<glam::Vec4>> { // Option<Vec<Vertex>>
-        self.device.poll(wgpu::PollType::Poll).expect("GPU Error");
+    // use double buffering
+    pub fn compute_vertices(
+        &mut self,
+        mvp: glam::Mat4,
+        vertex_count: u32,
+    ) -> Option<Vec<glam::Vec4>> {
+        // Option<Vec<Vertex>>
+        // self.device.poll(wgpu::PollType::Poll).expect("GPU Error");
 
         // Send MVP to GPU
+        let uniform_payload = ComputeUniforms {
+            mvp: mvp.to_cols_array(),
+            vertex_count: vertex_count as u32,
+            _padding: [0; 3],
+        };
+
         self.queue.write_buffer(
             &self.mvp_buffer,
             0,
-            bytemuck::cast_slice(&mvp.to_cols_array()),
+            // bytemuck::cast_slice(&mvp.to_cols_array()),
+            bytemuck::bytes_of(&uniform_payload),
         );
 
         let mut output_vertices = None;
 
         // 1] Clear all Ready Buffers
         for ring in &mut self.ring_buffers {
-            if ring.is_mapping {
-                let Some(ref receiver) = ring.receiver else {
-                    continue;
-                };
-
-                let Ok(Ok(())) = receiver.try_recv() else {
-                    continue;
-                };
-
-                let data = ring.staging_buffer.slice(..).get_mapped_range();
-                // let vertices: &[Vertex] = bytemuck::cast_slice(&data);
-                let vertices: &[glam::Vec4] = bytemuck::cast_slice(&data);
-                let out_vertices = vertices.to_vec();
-
-                drop(data);
-                ring.staging_buffer.unmap(); // Return ownership to GPU
-                ring.is_mapping = false;
-                ring.receiver = None;
-
-                output_vertices = Some(out_vertices);
+            if !ring.is_mapping {
+                continue;
             }
+
+            let Some(ref receiver) = ring.receiver else {
+                continue;
+            };
+
+            let Ok(Ok(())) = receiver.try_recv() else {
+                continue;
+            };
+
+            let data = ring.staging_buffer.slice(..).get_mapped_range();
+            // let vertices: &[Vertex] = bytemuck::cast_slice(&data);
+            let clip_space_vertices: &[glam::Vec4] = bytemuck::cast_slice(&data);
+            // let t = clip_space_vertices[0];
+            // println!("{t}");
+            let out_vertices = clip_space_vertices.to_vec();
+
+            drop(data);
+            ring.staging_buffer.unmap(); // Return ownership to GPU
+            ring.is_mapping = false;
+            ring.receiver = None;
+
+            output_vertices = Some(out_vertices);
         }
 
         // 2] Launch current Ring
@@ -292,6 +335,7 @@ impl GPUData {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
             {
+                // Compute Pass
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: None,
                     timestamp_writes: None,
@@ -300,10 +344,12 @@ impl GPUData {
                 compute_pass.set_bind_group(0, &current_ring.bind_group, &[]);
                 // compute_pass.dispatch_workgroups(1, 1, 1);
 
+                // Start workgroups -> threads
                 let workgroup_count = (vertex_count + 63) / 64;
                 compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
             }
 
+            // Copy output -> staging
             encoder.copy_buffer_to_buffer(
                 &current_ring.output_buffer,
                 0,
@@ -312,6 +358,7 @@ impl GPUData {
                 self.buffer_size,
             );
 
+            // Submit + feedback
             self.queue.submit(Some(encoder.finish()));
             current_ring.is_mapping = true;
 

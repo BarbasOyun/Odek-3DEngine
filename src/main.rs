@@ -115,6 +115,8 @@ fn main() {
     });
 }
 
+// DATA STRUCTS
+
 struct Bindings {
     forward: egui::Key,
     left: egui::Key,
@@ -142,11 +144,12 @@ impl Bindings {
     }
 }
 
+// GPU vertex struct
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub position: [f32; 3],
-    pub _padding: f32, // 16 bytes
+    pub _padding: f32, // 12 + 4 = 16 bytes
 }
 
 impl Vertex {
@@ -158,8 +161,6 @@ impl Vertex {
     }
 }
 
-#[repr(C)] // Prevent rust from reordering struct fields - Memory Layout need to be clean for GPU
-// #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct ModelData {
     vertices: Vec<Vertex>,
     faces: Vec<Vec<u16>>,
@@ -189,8 +190,6 @@ impl fmt::Display for ModelData {
     }
 }
 
-// OdekGPU
-
 struct OdekEngine {
     // RENDERING
     gpu_computing: bool,
@@ -207,6 +206,7 @@ struct OdekEngine {
     camera_forward: Vec3,
     fov: f32, // Field of View (Degrees)
     perspective: bool,
+    near_plane: f32,
     // LOGIC : Transformations
     bindings: Bindings,
     azerty: bool,
@@ -234,9 +234,9 @@ impl OdekEngine {
 
         let cube = Self::cube();
 
-        // Triangulated cube
-        // let mut cube = Self::cube();
-        // Self::triangulate_faces(&mut cube);
+        // cube2 = Triangulated
+        // let mut cube2 = Self::cube();
+        // Self::triangulate_faces(&mut cube2);
 
         let gpu_data = GPUData::new(cc, &cube);
 
@@ -255,6 +255,7 @@ impl OdekEngine {
             camera_forward: Vec3::new(0.0, 0.0, 1.0),
             fov: 90.0,
             perspective: true,
+            near_plane: 0.1,
             // LOGIC : Inputs
             bindings: Bindings::qwerty(),
             azerty: false,
@@ -384,13 +385,13 @@ impl OdekEngine {
             let fov_y_radians = 2.0
                 * f32::atan(
                     f32::tan(self.fov.to_radians() / 2.0) / self.three_d_viewport.aspect_ratio(),
-                );
+                ); // self.fov.to_radians()
 
             projection = glam::Mat4::perspective_rh(
-                fov_y_radians, // self.fov.to_radians(),
+                fov_y_radians,
                 self.three_d_viewport.aspect_ratio(),
-                0.1,    // Near clip
-                1000.0, // Far clip
+                self.near_plane, // Near clip
+                1000.0,          // Far clip
             );
         } else {
             let half_width = self.three_d_viewport.width() * 0.001;
@@ -401,15 +402,15 @@ impl OdekEngine {
                 half_width,
                 -half_height,
                 half_height,
-                0.1,
+                self.near_plane,
                 1000.0,
             );
         }
 
+        // 4) Apply Matrices : Model -> View -> Projection
         // TODO : Calc vp once / frame -> per model m * vp
         // let vp = view * model;
 
-        // 4) Apply Matrices : Model -> View -> Projection
         let mvp: glam::Mat4 = projection * view * model;
 
         // 5) Projection : GPU Computing + CPU Fallback
@@ -434,7 +435,7 @@ impl OdekEngine {
             // }
 
             let clip_space_vertices =
-                gpu_data.double_buffering(mvp, self.model_data.vertices.len() as u32);
+                gpu_data.compute_vertices(mvp, self.model_data.vertices.len() as u32);
 
             if let Some(clip_space_vertices) = clip_space_vertices {
                 let screen_points = clip_space_vertices
@@ -453,6 +454,7 @@ impl OdekEngine {
             self.gpu_data = Some(gpu_data);
         }
 
+        // CPU
         let screen_points = self
             .model_data
             .vertices
@@ -471,8 +473,12 @@ impl OdekEngine {
             })
             .collect();
 
-        // println!("CPU");
         return screen_points;
+    }
+
+    fn out_of_fov_edge_rendering(clip_space_v: &glam::Vec4) -> glam::Vec4 {
+        // find unique edge / model first
+        todo!()
     }
 
     // clip_space_vertex -> screen point
