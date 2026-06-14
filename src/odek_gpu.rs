@@ -15,7 +15,7 @@ pub struct RingBuffer {
 // Struct for Binding 0 -> MVP + vertex count
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct ComputeUniforms {
+struct UniformData {
     // mat4x4 = 16-element f32 array = 64 bytes
     mvp: [f32; 16],
     // 32 / 8 = 4 bytes
@@ -117,7 +117,7 @@ impl GPUData {
         // MVP Buffer
         let identity_matrix = glam::Mat4::IDENTITY;
 
-        let uniform: ComputeUniforms = ComputeUniforms {
+        let uniform: UniformData = UniformData {
             mvp: identity_matrix.to_cols_array(),
             vertex_count: model.vertices.len() as u32,
             _padding: [0; 3],
@@ -147,7 +147,7 @@ impl GPUData {
         });
     }
 
-    pub fn setup_model_ring(
+    fn setup_model_ring(
         device: &wgpu::Device,
         bind_group_layout: &wgpu::BindGroupLayout,
         mvp_buffer: &wgpu::Buffer,
@@ -274,7 +274,7 @@ impl GPUData {
         // self.device.poll(wgpu::PollType::Poll).expect("GPU Error");
 
         // Send MVP to GPU
-        let uniform_payload = ComputeUniforms {
+        let uniform_payload = UniformData {
             mvp: mvp.to_cols_array(),
             vertex_count: vertex_count as u32,
             _padding: [0; 3],
