@@ -3,7 +3,6 @@
 -[Web Version](https://barbasoyun.github.io/3DEngine/)<br>
 -Odek is a 3D Engine written in Rust and using egui for rendering<br>
 -It as both a desktop/native and web version<br>
--WIP<br>
 -Using [This Tsoding video](https://www.youtube.com/watch?v=qjWkNZ0SXfo&list=WL&index=9&t=17s) as reference<br>
 
 ## Controls
@@ -17,7 +16,7 @@
 -Transform 3D Model<br>
 -Move + Rotate Camera<br>
 -Import OBJ File<br>
--Right-Handed 3D (Z forward = -Z, Camera start at 180° Y Rotation) Similar to : Blender, Godot, OpenGl, Vulkan<br>
+-Right-Handed 3D (Z forward = -Z) Similar to : Blender, Godot, OpenGl, Vulkan<br>
 
 ### GPU Computing
 
@@ -38,13 +37,9 @@
 
 -A lot of dead code / comments but I want to keep it as exemple (Old Engine)<br>
 
-## To Go Further
+## Limitations
 
--Optimisations : Triangulate Faces, ...<br>
--Render Faces<br>
--Calculate Face Normals<br>
--Lighting<br>
--Textures<br>
+-Since its using egui for rendering and has the name sujest egui is made for Graphical User Interface which mean 2D and so the biggest limitation of this engine is the models overlapping each others<br>
 
 ## Progress
 

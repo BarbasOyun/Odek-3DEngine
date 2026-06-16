@@ -1,16 +1,22 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 mod odek_gpu;
+mod utils;
 // mod old_engine;
 
-use crate::odek_gpu::GPUData;
 use eframe::{CreationContext, egui::*};
 use glam::Vec3;
-use std::fmt;
 use std::vec;
 
 // Import File
 use rfd::AsyncFileDialog;
 use std::sync::mpsc::{Receiver, Sender, channel};
+
+// Crate Import
+use crate::odek_gpu::GPUData;
+use crate::utils::Bindings;
+use crate::utils::Model;
+use crate::utils::ModelData;
+use crate::utils::Vertex;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
@@ -115,169 +121,30 @@ fn main() {
     });
 }
 
-// DATA STRUCTS
-
-struct Bindings {
-    forward: egui::Key,
-    left: egui::Key,
-    backward: egui::Key,
-    right: egui::Key,
-}
-
-impl Bindings {
-    fn qwerty() -> Self {
-        Self {
-            forward: egui::Key::W,
-            left: egui::Key::A,
-            backward: egui::Key::S,
-            right: egui::Key::D,
-        }
-    }
-
-    fn azerty() -> Self {
-        Self {
-            forward: egui::Key::Z,
-            left: egui::Key::Q,
-            backward: egui::Key::S,
-            right: egui::Key::D,
-        }
-    }
-}
-
-// GPU vertex struct
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    _padding: f32, // 12 + 4 = 16 bytes
-}
-
-impl Vertex {
-    fn new(x: f32, y: f32, z: f32) -> Self {
-        Self {
-            position: [x, y, z],
-            _padding: 0.0,
-        }
-    }
-}
-
-struct ModelData {
-    // TODO : array
-    vertices: Vec<Vertex>,
-    faces: Vec<Vec<u16>>,
-}
-
-impl fmt::Display for ModelData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
-        write!(
-            f,
-            "ModelData (Vertices: {}, Faces: {})\n",
-            self.vertices.len(),
-            self.faces.len()
-        )?;
-
-        // write vertices
-        // write!(f, "  Vertices:\n")?;
-        // for (i, vertex) in self.vertices.iter().enumerate() {
-        //     write!(f, "    [{}]: {:?}\n", i, vertex)?;
-        // }
-
-        write!(f, "  Faces:\n")?;
-        for (i, face) in self.faces.iter().enumerate() {
-            write!(f, "    [{}]: {:?}\n", i, face)?;
-        }
-
-        Ok(())
-    }
-}
-
-struct Model {
-    id: u8,
-    // Model
-    vertex_count: u32,
-    face_count: u32,
-    // Transform
-    position: Vec3,
-    rotation: Vec3, // Degrees
-    scale: Vec3,
-    // Transformations
-    is_translating: bool,
-    is_rotating: bool,
-    is_scaling: bool,
-    translate_osciallator: f32,
-    scale_osciallator: f32,
-}
-
-impl Model {
-    fn new(
-        id: u8,
-        vertex_count: u32,
-        face_count: u32,
-        position: Vec3,
-        rotation: Vec3,
-        scale: Vec3,
-        is_translating: bool,
-        is_rotating: bool,
-        is_scaling: bool,
-    ) -> Model {
-        return Self {
-            id,
-            vertex_count,
-            face_count,
-            position,
-            rotation,
-            scale,
-            is_translating,
-            is_rotating,
-            is_scaling,
-            translate_osciallator: 0.0,
-            scale_osciallator: 0.0,
-        };
-    }
-
-    fn default(id: u8, vertex_count: u32, face_count: u32) -> Self {
-        return Self {
-            id,
-            vertex_count,
-            face_count,
-            position: Vec3::ZERO,
-            rotation: Vec3::ZERO,
-            scale: Vec3::ONE,
-            is_translating: false,
-            is_rotating: true,
-            is_scaling: false,
-            translate_osciallator: 0.0,
-            scale_osciallator: 0.0,
-        };
-    }
-}
-
 // mut engine data
 struct EngineState {
-    current_model: usize, // index of selected model
+    current_model_index: usize,
     // Camera
     // TODO : Store Radians instead of Degrees (Performance)
     camera_position: Vec3,
     camera_rotation: Vec3, // Yaw, Pitch, Roll -> Degrees°
     camera_forward: Vec3,
     // Models
-    // Flattened vertices + faces
-    vertices: Vec<Vertex>,
-    faces: Vec<Vec<u16>>,
+    global_model: ModelData,
     models: Vec<Model>, // models data to get the vertices & faces
 }
 
 impl EngineState {
     fn new() -> Self {
+        // Model Data
         let mut cube1 = OdekEngine::cube();
 
         let mut cube2 = OdekEngine::cube();
         OdekEngine::triangulate_faces(&mut cube2);
 
         // Models
-        let model1 = Model::default(0, cube1.vertices.len() as u32, cube1.faces.len() as u32);
+        let model1 = Model::default(cube1.vertices.len() as u32, cube1.faces.len() as u32);
         let model2 = Model::new(
-            1,
             cube2.vertices.len() as u32,
             cube2.faces.len() as u32,
             Vec3::new(1.5, 0.0, -1.5),
@@ -292,22 +159,29 @@ impl EngineState {
 
         // Global Model Data
         let mut vertices = vec![];
-        vertices.append(&mut cube1.vertices);
-        vertices.append(&mut cube2.vertices);
+        // vertices.append(&mut cube1.vertices);
+        // vertices.append(&mut cube2.vertices);
+        OdekEngine::append_vertices(0, &mut vertices, &mut cube1.vertices);
+        OdekEngine::append_vertices(1, &mut vertices, &mut cube2.vertices);
 
         let mut faces: Vec<Vec<u16>> = vec![];
         faces.append(&mut cube1.faces);
         faces.append(&mut cube2.faces);
 
+        let global_model = ModelData { vertices, faces };
+
+        // GPU
+
         return Self {
-            current_model: 0,
+            current_model_index: 0,
             // Camera
             camera_position: Vec3::new(0.0, 0.0, 1.5),
             camera_rotation: Vec3::ZERO,
             camera_forward: Vec3::ZERO,
             // Models
-            vertices,
-            faces,
+            // vertices,
+            // faces,
+            global_model,
             models,
         };
     }
@@ -322,7 +196,7 @@ struct Settings {
     sensitivity: f32,
     perspective: bool,
     fov: f32, // Field of View -> Degrees°
-    // Focal Length
+    // TODO : Focal Length
     near_plane: f32,
     // Bindings
     bindings: Bindings,
@@ -364,19 +238,23 @@ struct OdekEngine {
 impl OdekEngine {
     fn new(cc: &CreationContext) -> Self {
         let state = EngineState::new();
+        let settings = Settings::default();
 
-        // Communication Channel for Async File Loading
+        // Channel for Async File Loading
         let (tx, rx) = channel::<Vec<u8>>();
 
-        // TODO : Multi model GPU
-        // let globalModel = ModelData {state.vertices, state.faces};
-        // let gpu_data = GPUData::new(cc, globalModel);
+        // GPU Setup
+        let mut gpu_data = GPUData::new(cc);
+
+        if let Some(gpu_data) = &mut gpu_data {
+            gpu_data.set_model(&state.global_model);
+        }
 
         return Self {
             // ENGINE DATA
             state,
-            settings: Settings::default(),
-            gpu_data: None,
+            settings,
+            gpu_data,
             tx,
             rx,
             // RENDERING
@@ -389,10 +267,11 @@ impl OdekEngine {
     // RENDERING
 
     // Wireframe Rendering
-    fn render_frame(&self, painter: &egui::Painter) {
+    fn render_frame(&mut self, painter: &egui::Painter) {
+        let screen_points: Vec<Option<egui::Vec2>> = self.frame_image();
+
         let state = &self.state;
         let settings = &self.settings;
-        let screen_points: Vec<Option<egui::Vec2>> = self.frame_image();
 
         // Render Vertices
         if settings.display_vertices {
@@ -413,7 +292,7 @@ impl OdekEngine {
             // foreach model's faces
             for i in 0..model.face_count {
                 let face_index = (face_count + i) as usize;
-                let face = &state.faces[face_index];
+                let face = &state.global_model.faces[face_index];
 
                 // foreach vertex index in face
                 for j in 0..face.len() {
@@ -444,7 +323,70 @@ impl OdekEngine {
 
     // Base Model Vertices * MVP Matrix -> Model (Vertices & Transformations) * View * Projection -> Projection 2D Frustum / Clip Space -> Screen Space
     // return points on screen
-    fn frame_image(&self) -> Vec<Option<egui::Vec2>> {
+    fn frame_image(&mut self) -> Vec<Option<egui::Vec2>> {
+        let state = &self.state;
+        let settings = &self.settings;
+
+        // 3] Model -> Per model MVP
+        let models_mvp: Vec<glam::Mat4> = self.get_models_mvp();
+
+        // 4] Projection : GPU Computing + CPU Fallback
+        // TODO : store screen points in state
+        // GPU
+        if settings.gpu_computing
+            && let Some(ref mut gpu_data) = self.gpu_data
+        {
+            let clip_space_vertices =
+                gpu_data.compute_vertices(&models_mvp, state.global_model.vertices.len() as u32);
+
+            if let Some(clip_space_vertices) = clip_space_vertices {
+                let screen_points = clip_space_vertices
+                    .iter()
+                    .map(|clip_space_v| {
+                        return self.clip_to_screen(clip_space_v);
+                    })
+                    .collect();
+
+                return screen_points;
+            }
+        }
+
+        // CPU
+        let mut model_id = 0;
+        let mut vertex_count = 0;
+        let mut model_vertices_count = 0;
+
+        let screen_points = state
+            .global_model
+            .vertices
+            .iter()
+            .map(|vertex| {
+                let model_vertices = state.models[model_id].vertex_count;
+
+                if vertex_count >= model_vertices_count + model_vertices {
+                    model_vertices_count += model_vertices;
+                    model_id += 1;
+                }
+
+                let vertex_vec4 = glam::vec4(
+                    vertex.position[0],
+                    vertex.position[1],
+                    vertex.position[2],
+                    1.0,
+                );
+
+                let clip_space_v = models_mvp[model_id] * vertex_vec4;
+
+                vertex_count += 1;
+                return self.clip_to_screen(&clip_space_v);
+            })
+            .collect();
+
+        return screen_points;
+    }
+
+    // Calculate VP and MVP / Model
+    fn get_models_mvp(&self) -> Vec<glam::Mat4> {
         let state = &self.state;
         let settings = &self.settings;
 
@@ -453,8 +395,8 @@ impl OdekEngine {
         let view = glam::Mat4::look_at_rh(
             state.camera_position,
             state.camera_position + state.camera_forward,
-            Vec3::Y,
-        ); // Vec3::Y = (0, 1, 0)
+            Vec3::Y, // Vec3::Y = (0, 1, 0)
+        );
 
         // 2] Projection
         let projection;
@@ -510,62 +452,7 @@ impl OdekEngine {
             models_mvp.push(mvp);
         }
 
-        // 4] Projection : GPU Computing + CPU Fallback
-        // GPU
-        /*
-        if self.gpu_computing
-            && let Some(mut gpu_data) = self.gpu_data.take()
-        {
-            let clip_space_vertices =
-                gpu_data.compute_vertices(mvp, self.model_data.vertices.len() as u32);
-
-            if let Some(clip_space_vertices) = clip_space_vertices {
-                let screen_points = clip_space_vertices
-                    .iter()
-                    .map(|clip_space_v| {
-                        return self.clip_to_screen(clip_space_v);
-                    })
-                    .collect();
-
-                self.gpu_data = Some(gpu_data);
-                return screen_points;
-            }
-
-            self.gpu_data = Some(gpu_data);
-        }
-        */
-
-        // CPU
-        let mut model_id = 0;
-        let mut vertex_count = 0;
-        let mut model_vertices_count = 0;
-
-        let screen_points = state
-            .vertices
-            .iter()
-            .map(|vertex| {
-                let model_vertices = state.models[model_id].vertex_count;
-
-                if vertex_count >= model_vertices_count + model_vertices {
-                    model_vertices_count += model_vertices;
-                    model_id += 1;
-                }
-
-                let vertex_vec4 = glam::vec4(
-                    vertex.position[0],
-                    vertex.position[1],
-                    vertex.position[2],
-                    1.0,
-                );
-
-                let clip_space_v = models_mvp[model_id] * vertex_vec4;
-
-                vertex_count += 1;
-                return self.clip_to_screen(&clip_space_v);
-            })
-            .collect();
-
-        return screen_points;
+        return models_mvp;
     }
 
     fn out_of_fov_edge_rendering(clip_space_v: &glam::Vec4) -> glam::Vec4 {
@@ -624,35 +511,55 @@ impl OdekEngine {
 
     // SCENE / MODELS
 
-    fn add_model(&mut self, model: &mut ModelData) {
-        let state = &mut self.state;
+    fn append_vertices(model_id: u32, original: &mut Vec<Vertex>, append: &mut Vec<Vertex>) {
+        for vertex in append.iter_mut() {
+            vertex.model_index = model_id;
+        }
 
-        // Add the models data at then end of the global models data
-        state.vertices.append(&mut model.vertices);
-        state.faces.append(&mut model.faces);
-
-        // Add Model
-        let id = state.models.len();
-        let model = Model::default(
-            id as u8,
-            model.vertices.len() as u32,
-            model.faces.len() as u32,
-        );
-        state.models.push(model);
+        original.append(append);
     }
 
-    // fn set_model(&mut self, model: ModelData) {
-    //     self.model_data = model;
+    fn add_model(&mut self, model_data: &mut ModelData) {
+        let state = &mut self.state;
+        let global_model = &mut state.global_model;
 
-    //     let Some(gpu_data) = self.gpu_data.as_mut() else {
-    //         return;
-    //     };
+        // Add Model
+        let model_id = state.models.len();
+        let model = Model::default(
+            model_data.vertices.len() as u32,
+            model_data.faces.len() as u32,
+        );
 
-    //     gpu_data.set_model(&self.model_data);
-    // }
+        state.models.push(model);
+
+        // Add to Global Model Data
+        Self::append_vertices(
+            model_id as u32,
+            &mut global_model.vertices,
+            &mut model_data.vertices,
+        );
+        global_model.faces.append(&mut model_data.faces);
+
+        // GPU
+        let Some(gpu_data) = self.gpu_data.as_mut() else {
+            return;
+        };
+
+        gpu_data.set_model(&global_model);
+    }
 
     fn remove_model(&mut self, index: u8) {
         todo!()
+    }
+
+    fn remove_all_models(&mut self) {
+        let state = &mut self.state;
+
+        state.models.clear();
+
+        state.global_model = ModelData::new(vec![], vec![]);
+
+        state.current_model_index = 0;
     }
 
     fn reset_scene(&mut self) {
@@ -722,7 +629,9 @@ impl OdekEngine {
             .map(|f| f.iter().map(|&i| i as u16).collect())
             .collect();
 
-        // self.set_model(ModelData { vertices, faces });
+        let mut model_data = ModelData { vertices, faces };
+        self.remove_all_models();
+        self.add_model(&mut model_data);
     }
 
     // Models Transformations
@@ -814,6 +723,12 @@ impl OdekEngine {
                 self.pick_obj_async();
             }
 
+            // Add Cube
+            if ui.button("Add Cube").clicked() {
+                let mut cube = Self::cube();
+                self.add_model(&mut cube);
+            }
+
             // Reset Scene
             if ui.button("Reset Scene").clicked() {
                 self.reset_scene()
@@ -844,10 +759,28 @@ impl OdekEngine {
     }
 
     fn current_model_transform(&mut self, ui: &mut Ui) {
-        let current_model = &mut self.state.models[self.state.current_model];
+        let state = &mut self.state;
+
+        // Select Current Model
+        ui.horizontal(|ui| {
+            ui.label("Model Selection : ");
+
+            let model_count = state.models.len() as u32;
+
+            for i in 0..model_count {
+                let button_text = format!("Model {i}");
+                if ui.button(button_text).clicked() {
+                    state.current_model_index = i as usize;
+                }
+            }
+        });
+
+        let current_model = &mut state.models[state.current_model_index];
 
         ui.horizontal(|ui| {
-            ui.label("Model");
+            let current_model_index = state.current_model_index;
+            let label_text = format!("Model {current_model_index}");
+            ui.label(label_text);
 
             // Model Position
             ui.label("Position :");

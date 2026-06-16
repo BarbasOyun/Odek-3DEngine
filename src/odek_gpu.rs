@@ -1,8 +1,12 @@
 use crate::ModelData;
+use crate::Vertex;
 
 use eframe::CreationContext;
 use std::sync::mpsc::Receiver;
-use wgpu::util::DeviceExt;
+use wgpu::ShaderModule;
+
+const MAX_MODELS: usize = 256; // TODO : Re-size buffer on reaching max
+const MAX_VERTEX: usize = 8192;
 
 pub struct RingBuffer {
     is_mapping: bool,
@@ -17,7 +21,7 @@ pub struct RingBuffer {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct UniformData {
     // mat4x4 = 16-element f32 array = 64 bytes
-    mvp: [f32; 16],
+    // mvp: [f32; 16],
     // 32 / 8 = 4 bytes
     vertex_count: u32,
     // Add padding to be multiple of 16 :
@@ -29,18 +33,20 @@ struct UniformData {
 pub struct GPUData {
     device: wgpu::Device,
     queue: std::sync::Arc<wgpu::Queue>,
-    // Buffers
-    mvp_buffer: wgpu::Buffer,
-    buffer_size: wgpu::BufferAddress,
-    ring_buffers: [RingBuffer; 2], // Double Buffering
-    current_ring_index: usize,
     // Pipeline
     compute_pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    // Buffers
+    uniform_buffer: wgpu::Buffer,
+    mvp_buffer: wgpu::Buffer,
+    input_buffer: wgpu::Buffer,
+    vertex_buffer_size: wgpu::BufferAddress,
+    ring_buffers: [RingBuffer; 2], // Double Buffering
+    current_ring_index: usize,
 }
 
 impl GPUData {
-    pub fn new(cc: &CreationContext, model: &ModelData) -> Option<Self> {
+    pub fn new(cc: &CreationContext) -> Option<Self> {
+        // INIT
         let state: Option<&eframe::egui_wgpu::RenderState> = cc.wgpu_render_state.as_ref();
 
         let Some(wgpu_render_state) = state else {
@@ -58,10 +64,36 @@ impl GPUData {
         });
 
         // PIPELINE
+        let (bind_group_layout, compute_pipeline) = Self::get_pipeline(&device, shader);
+
+        // BUFFERS
+        let (uniform_buffer, mvp_buffer, input_buffer, vertex_buffer_size, ring_buffers) =
+            Self::setup_buffers(&device, bind_group_layout);
+
+        return Some(Self {
+            device,
+            queue,
+            // Pipeline
+            compute_pipeline,
+            // Buffers
+            uniform_buffer,
+            mvp_buffer,
+            input_buffer,
+            vertex_buffer_size,
+            // Ring Buffers
+            ring_buffers,
+            current_ring_index: 0,
+        });
+    }
+
+    fn get_pipeline(
+        device: &wgpu::Device,
+        shader: ShaderModule,
+    ) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Compute Bind Group Layout"),
             entries: &[
-                // MVP Uniform
+                // Uniform
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -72,7 +104,7 @@ impl GPUData {
                     },
                     count: None,
                 },
-                // Input Storage
+                // Models MVP
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -83,9 +115,20 @@ impl GPUData {
                     },
                     count: None,
                 },
-                // Output Storage
+                // Input Storage
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Output Storage
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -112,68 +155,66 @@ impl GPUData {
             cache: None,
         });
 
-        // BUFFERS
-
-        // MVP Buffer
-        let identity_matrix = glam::Mat4::IDENTITY;
-
-        let uniform: UniformData = UniformData {
-            mvp: identity_matrix.to_cols_array(),
-            vertex_count: model.vertices.len() as u32,
-            _padding: [0; 3],
-        };
-
-        let mvp_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MVP Uniform Buffer"),
-            contents: bytemuck::bytes_of(&uniform),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let (buffer_size, ring_buffers) =
-            Self::setup_model_ring(&device, &bind_group_layout, &mvp_buffer, &model);
-
-        return Some(Self {
-            device,
-            queue,
-            // Buffers
-            mvp_buffer,
-            buffer_size,
-            // Ring Buffers
-            ring_buffers,
-            current_ring_index: 0,
-            // Pipeline
-            compute_pipeline,
-            bind_group_layout,
-        });
+        return (bind_group_layout, compute_pipeline);
     }
 
-    fn setup_model_ring(
+    // Allocate Minimum size on GPU
+    fn setup_buffers(
         device: &wgpu::Device,
-        bind_group_layout: &wgpu::BindGroupLayout,
-        mvp_buffer: &wgpu::Buffer,
-        model: &ModelData,
-    ) -> (u64, [RingBuffer; 2]) {
-        // Input Buffer -> Binding 1
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&model.vertices),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        bind_group_layout: wgpu::BindGroupLayout,
+    ) -> (
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        u64,
+        [RingBuffer; 2],
+    ) {
+        // Binding 0
+        // Uniform Buffer
+        let uniform_size = std::mem::size_of::<UniformData>(); // 16 bytes
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Uniform Buffer"),
+            size: uniform_size as u64, // vertex_count: u32 + padding: [u32; 3]
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
-        let buffer_size =
-            (model.vertices.len() * std::mem::size_of::<glam::Vec4>()) as wgpu::BufferAddress;
+        // Binding 1
+        // MVPs Buffer
+        let matrix_size = std::mem::size_of::<[f32; 16]>(); // 64 bytes per MVP
+        let mvp_buffer_size = (matrix_size * MAX_MODELS) as u64;
 
-        // Output buffers -> Binding 2
+        let mvp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MVP Storage Buffer"),
+            size: mvp_buffer_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let vertex_size = std::mem::size_of::<Vertex>();
+        let vertex_buffer_size = (MAX_VERTEX * vertex_size) as wgpu::BufferAddress;
+
+        // Binding 2
+        // input Buffer
+        let input_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Input Buffer"),
+            size: vertex_buffer_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Binding 3
+        // Output buffers
         let output_buffer1 = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Output Vertex Buffer1"),
-            size: buffer_size,
+            size: vertex_buffer_size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let output_buffer2 = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Output Vertex Buffer2"),
-            size: buffer_size,
+            size: vertex_buffer_size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -181,14 +222,14 @@ impl GPUData {
         // Staging Buffers : Copy output buffer -> Staging
         let staging_buffer1 = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Staging Buffer1"),
-            size: buffer_size,
+            size: vertex_buffer_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let staging_buffer2 = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Staging Buffer2"),
-            size: buffer_size,
+            size: vertex_buffer_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -200,14 +241,18 @@ impl GPUData {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: mvp_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: vertex_buffer.as_entire_binding(),
+                    resource: mvp_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: input_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: output_buffer1.as_entire_binding(),
                 },
             ],
@@ -219,14 +264,18 @@ impl GPUData {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: mvp_buffer.as_entire_binding(),
+                    resource: uniform_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: vertex_buffer.as_entire_binding(),
+                    resource: mvp_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: input_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: output_buffer2.as_entire_binding(),
                 },
             ],
@@ -250,41 +299,48 @@ impl GPUData {
 
         let ring_buffers = [ring1, ring2];
 
-        return (buffer_size, ring_buffers);
+        return (
+            uniform_buffer,
+            mvp_buffer,
+            input_buffer,
+            vertex_buffer_size,
+            ring_buffers,
+        );
     }
 
     pub fn set_model(&mut self, model_data: &ModelData) {
-        let (buffer_size, ring_buffers) = Self::setup_model_ring(
-            &self.device,
-            &self.bind_group_layout,
-            &self.mvp_buffer,
-            model_data,
-        );
+        // Send Uniform to GPU
+        let vertex_count = model_data.vertices.len();
 
-        self.buffer_size = buffer_size;
-        self.ring_buffers = ring_buffers;
-    }
-
-    // use double buffering
-    pub fn compute_vertices(
-        &mut self,
-        mvp: glam::Mat4,
-        vertex_count: u32,
-    ) -> Option<Vec<glam::Vec4>> {
-        // self.device.poll(wgpu::PollType::Poll).expect("GPU Error");
-
-        // Send MVP to GPU
         let uniform_payload = UniformData {
-            mvp: mvp.to_cols_array(),
             vertex_count: vertex_count as u32,
             _padding: [0; 3],
         };
 
         self.queue.write_buffer(
-            &self.mvp_buffer,
+            &self.uniform_buffer,
             0,
             bytemuck::bytes_of(&uniform_payload),
         );
+
+        // Send Input Vertex
+        self.queue.write_buffer(
+            &self.input_buffer,
+            0,
+            bytemuck::cast_slice(&model_data.vertices),
+        );
+    }
+
+    // use double buffering
+    pub fn compute_vertices(
+        &mut self,
+        // mvp: glam::Mat4,
+        models_mvp: &Vec<glam::Mat4>,
+        vertex_count: u32,
+    ) -> Option<Vec<glam::Vec4>> {
+        // Send MVP
+        self.queue
+            .write_buffer(&self.mvp_buffer, 0, bytemuck::cast_slice(&models_mvp));
 
         let mut output_vertices = None;
 
@@ -331,7 +387,6 @@ impl GPUData {
                 });
                 compute_pass.set_pipeline(&self.compute_pipeline);
                 compute_pass.set_bind_group(0, &current_ring.bind_group, &[]);
-                // compute_pass.dispatch_workgroups(1, 1, 1);
 
                 // Start workgroups -> threads
                 let workgroup_count = (vertex_count + 63) / 64;
@@ -344,7 +399,7 @@ impl GPUData {
                 0,
                 &current_ring.staging_buffer,
                 0,
-                self.buffer_size,
+                self.vertex_buffer_size,
             );
 
             // Submit + feedback
